@@ -1,0 +1,56 @@
+MODULE Weather;
+
+// Ядро интеграции с погодой: хранение прогноза по точкам размещения + точка расширения для провайдера.
+// Провайдер (например, WeatherOpenWeatherMap) реализует ABSTRACT updateWeather(Location).
+REQUIRE Location;
+
+NAMESPACE Weather;
+
+// ===== Прогноз: одна запись = (точка размещения, момент времени) =====
+CLASS WeatherForecast 'Прогноз погоды';
+TABLE weatherForecast (WeatherForecast);
+
+location = DATA Location (WeatherForecast);
+time 'Время' = DATA ZDATETIME (WeatherForecast);
+fetched 'Получено' = DATA ZDATETIME (WeatherForecast);
+temperature 'Температура, °C' = DATA DOUBLE (WeatherForecast);
+feelsLike 'Ощущается, °C' = DATA DOUBLE (WeatherForecast);
+humidity 'Влажность, %' = DATA INTEGER (WeatherForecast);
+precipitation 'Вероятность осадков, %' = DATA INTEGER (WeatherForecast);
+windSpeed 'Ветер, м/с' = DATA DOUBLE (WeatherForecast);
+cloudCover 'Облачность, %' = DATA INTEGER (WeatherForecast);
+conditionCode 'Код погоды' = DATA INTEGER (WeatherForecast);
+conditionName 'Погода' = DATA STRING[60] (WeatherForecast);
+icon 'Иконка' = DATA STRING[10] (WeatherForecast);
+
+// Уникальность: один прогноз на (точка, момент); повторный фетч перезаписывает запись
+forecastByLocationTime = GROUP AGGR WeatherForecast f BY location(f), time(f);
+
+// ===== Чтения =====
+// Действующий прогноз для точки на момент zdt = последняя запись со временем <= zdt
+applicableForecast (Location l, ZDATETIME zdt) =
+    GROUP LAST WeatherForecast f ORDER time(f), f WHERE location(f) = l AND time(f) <= zdt;
+// Прогноз/факт на «сейчас»
+currentForecast (Location l) = applicableForecast(l, currentZDateTime());
+
+// Метрики по точке и моменту (используются в отчётах/управлениях/виджете)
+forecastTemperature 'Внешняя t° (прогноз), °C' (Location l, ZDATETIME zdt) = temperature(applicableForecast(l, zdt));
+forecastHumidity 'Внешняя влажность (прогноз), %' (Location l, ZDATETIME zdt) = humidity(applicableForecast(l, zdt));
+forecastWindSpeed 'Ветер (прогноз), м/с' (Location l, ZDATETIME zdt) = windSpeed(applicableForecast(l, zdt));
+forecastCondition 'Погода (прогноз)' (Location l, ZDATETIME zdt) = conditionName(applicableForecast(l, zdt));
+
+// ===== Точка расширения провайдера =====
+updateWeather ABSTRACT LIST (Location);
+updateWeatherAll 'Обновить погоду (все точки)' () {
+    FOR Location l IS Location AND latitude(l) AND longitude(l) DO
+        updateWeather(l);
+}
+
+nameLocation 'Точка' (WeatherForecast f) = name(location(f));
+
+// ===== Форма-справочник (грид прогноза) =====
+FORM weatherForecasts 'Прогноз погоды'
+    OBJECTS f = WeatherForecast
+    PROPERTIES (f) READONLY nameLocation, time, temperature, feelsLike, humidity, precipitation, windSpeed, cloudCover, conditionName
+    ORDERS time(f)
+;

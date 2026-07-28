@@ -1,0 +1,678 @@
+MODULE Agro;
+
+// ============================================================
+//  АГРО-КЕЙС на ШТАТНОМ механизме объектов (EquipmentType «Грядка/Поле/Теплица» + EquipmentUnit +
+//  «Конструктор объектов»). Агро-объект = EquipmentUnit с агро-атрибутами и датчиками.
+//  Датчики: воздух t°/влажность берём с MITE-датчика (euDevice, live) ИЛИ симуляция;
+//           почва (влажность/t°) и смачивание листа — доп. агро-показатели (генерим значения).
+//  Погода: реальный прогноз OpenWeatherMap по координатам ПЛОЩАДКИ (Location) → решения + ₽.
+//    заморозок → укрыть/обогрев; дождь+сухо → полив отложить; сухо → полить;
+//    лист мокрый+влажно → риск болезни (обработка); тихо и сухо → окно опрыскивания.
+// ============================================================
+REQUIRE Scheme, Weather, WeatherOpenWeatherMap;
+
+NAMESPACE Agro;
+
+r0 (NUMERIC[14,2] x) = INTEGER(x + 0.5);
+
+// ===================== Доп. типы измерений (агро) =====================
+soilMoistureType = GROUP AGGR MeasurementType t WHERE name(t) = r'Влажность почвы';
+soilTempType     = GROUP AGGR MeasurementType t WHERE name(t) = r'Температура почвы';
+leafWetType      = GROUP AGGR MeasurementType t WHERE name(t) = r'Смачивание листа';
+
+// ===================== Агро-надстройка над EquipmentUnit =====================
+isAgro 'Агро-объект' = DATA BOOLEAN (EquipmentUnit);
+crop 'Культура' = DATA STRING[40] (EquipmentUnit);
+areaHa 'Площадь, га' = DATA DOUBLE (EquipmentUnit);
+cropValueHa 'Урожай, ₽/га' = DATA DOUBLE (EquipmentUnit);
+frostThreshold 'Порог заморозка, °C' = DATA DOUBLE (EquipmentUnit);
+soilMoistMin 'Мин. влажность почвы, %' = DATA DOUBLE (EquipmentUnit);
+irrigationCostHa 'Полив, ₽/га' = DATA DOUBLE (EquipmentUnit);
+frostLossShare 'Доля потерь при заморозке' = DATA DOUBLE (EquipmentUnit);
+agroSite 'Площадка (погода)' = DATA Location (EquipmentUnit);   // координаты + прогноз
+nameAgroSite 'Площадка' (EquipmentUnit u) = name(agroSite(u));
+
+// демо-значения показателей (когда нет живого датчика — «генерим под все значения»)
+simAirTemp = DATA DOUBLE (EquipmentUnit);
+simAirHum = DATA DOUBLE (EquipmentUnit);
+simSoilMoist = DATA DOUBLE (EquipmentUnit);
+simSoilTemp = DATA DOUBLE (EquipmentUnit);
+simLeafWet = DATA DOUBLE (EquipmentUnit);
+
+// live-значение метрики с привязанного MITE-датчика (как euLiveValue в Scheme)
+liveMetric (EquipmentUnit u, MeasurementType mt) = prevLastValue(euDevice(u), mt) IF euSource(u) = 'live' AND euDevice(u);
+airTemp   'Воздух t°, °C'       (EquipmentUnit u) = OVERRIDE liveMetric(u, temperatureType()), simAirTemp(u);
+airHum    'Воздух влажн., %'    (EquipmentUnit u) = OVERRIDE liveMetric(u, humidityType()), simAirHum(u);
+soilMoist 'Почва влажн., %'     (EquipmentUnit u) = OVERRIDE liveMetric(u, soilMoistureType()), simSoilMoist(u);
+soilTemp  'Почва t°, °C'        (EquipmentUnit u) = OVERRIDE liveMetric(u, soilTempType()), simSoilTemp(u);
+leafWet   'Смачивание листа, %' (EquipmentUnit u) = OVERRIDE liveMetric(u, leafWetType()), simLeafWet(u);
+
+// ===================== Прогноз по площадке юнита =====================
+horizonEnd () = sumSeconds(currentZDateTime(), 86400);
+inHorizon (WeatherForecast f) = time(f) >= currentZDateTime() AND time(f) <= horizonEnd();
+fcCount (EquipmentUnit u) = GROUP SUM 1 IF location(WeatherForecast f) = agroSite(u) AND inHorizon(f);
+hasForecast (EquipmentUnit u) = fcCount(u) > 0;
+
+fMinTemp 'Мин. t° сутки, °C' (EquipmentUnit u) = GROUP MIN temperature(WeatherForecast f) IF location(f) = agroSite(u) AND inHorizon(f);
+fMaxTemp 'Макс. t° сутки, °C' (EquipmentUnit u) = GROUP MAX temperature(WeatherForecast f) IF location(f) = agroSite(u) AND inHorizon(f);
+fMaxPrecip 'Осадки сутки, %' (EquipmentUnit u) = GROUP MAX precipitation(WeatherForecast f) IF location(f) = agroSite(u) AND inHorizon(f);
+fMaxWind 'Ветер сутки, м/с' (EquipmentUnit u) = GROUP MAX windSpeed(WeatherForecast f) IF location(f) = agroSite(u) AND inHorizon(f);
+fNowTemp 't° сейчас, °C' (EquipmentUnit u) = temperature(currentForecast(agroSite(u)));
+fNowCond 'Погода сейчас' (EquipmentUnit u) = conditionName(currentForecast(agroSite(u)));
+
+// ===================== Решения (привязка к прогнозу + датчикам) =====================
+frostRisk 'Риск заморозка' (EquipmentUnit u) = isAgro(u) AND hasForecast(u) AND fMinTemp(u) <= frostThreshold(u);
+rainSoon 'Ожидается дождь' (EquipmentUnit u) = isAgro(u) AND hasForecast(u) AND fMaxPrecip(u) >= 60;
+isDry (EquipmentUnit u) = isAgro(u) AND soilMoist(u) < soilMoistMin(u);
+needIrrigation 'Нужен полив' (EquipmentUnit u) = isDry(u) AND NOT rainSoon(u) AND NOT frostRisk(u);
+diseaseRisk 'Риск болезни' (EquipmentUnit u) = isAgro(u) AND leafWet(u) >= 60 AND airHum(u) >= 85 AND NOT frostRisk(u);
+sprayWindow 'Окно опрыскивания' (EquipmentUnit u) = isAgro(u) AND hasForecast(u) AND fMaxWind(u) <= 5 AND fMaxPrecip(u) <= 30 AND NOT frostRisk(u) AND NOT needIrrigation(u);
+
+frostRiskRub 'Под угрозой, ₽' (EquipmentUnit u) = IF frostRisk(u) THEN r0(NUMERIC[14,2](areaHa(u) * cropValueHa(u) * frostLossShare(u)));
+savedRub 'Экономия, ₽' (EquipmentUnit u) = IF rainSoon(u) AND isDry(u) THEN r0(NUMERIC[14,2](areaHa(u) * irrigationCostHa(u)));
+
+// ===================== КАМЕРЫ + ИИ: качество листа и болезни по фото (ЖИВОЕ, авто, без кнопки) =====================
+leafPhoto 'Фото листа' = DATA IMAGEFILE (EquipmentUnit);
+// авто-ИИ: эвристика по условиям (мокрый лист+влажно → болезнь). Переопределяется реальной vision-моделью через *Ovr.
+leafDiseaseOvr = DATA STRING[60] (EquipmentUnit);
+leafQualityOvr = DATA INTEGER (EquipmentUnit);
+leafDiseaseAuto (EquipmentUnit u) = IF NOT isAgro(u) THEN NULL ELSE IF leafWet(u) >= 60 AND airHum(u) >= 85 THEN 'Мучнистая роса' ELSE IF leafWet(u) >= 45 THEN 'Бурая пятнистость' ELSE NULL;
+leafDisease 'Болезнь (ИИ)' (EquipmentUnit u) = OVERRIDE leafDiseaseOvr(u), leafDiseaseAuto(u);
+leafQuality 'Качество листа, %' (EquipmentUnit u) = OVERRIDE leafQualityOvr(u), (IF leafDiseaseAuto(u) = 'Мучнистая роса' THEN 55 ELSE IF leafDiseaseAuto(u) THEN 70 ELSE (IF isAgro(u) THEN 92));
+hasDisease (EquipmentUnit u) = isAgro(u) AND leafDisease(u);
+
+// ===================== УДОБРЕНИЯ (NPK) =====================
+soilN 'Азот N, мг/кг' = DATA DOUBLE (EquipmentUnit);
+soilP 'Фосфор P, мг/кг' = DATA DOUBLE (EquipmentUnit);
+soilK 'Калий K, мг/кг' = DATA DOUBLE (EquipmentUnit);
+nMin 'Порог N, мг/кг' = DATA DOUBLE (EquipmentUnit);
+lastFert 'Последняя подкормка' = DATA DATE (EquipmentUnit);
+lowN (EquipmentUnit u) = isAgro(u) AND soilN(u) < nMin(u);
+fertPlan 'План удобрения' (EquipmentUnit u) =
+    IF NOT isAgro(u) THEN ''
+    ELSE IF lowN(u) THEN 'Азот (карбамид) — низкий N'
+    ELSE IF leafDisease(u) = 'Хлороз' THEN 'Азот — хлороз листа'
+    ELSE IF (OVERRIDE leafQuality(u), 100) < 60 AND NOT hasDisease(u) THEN 'Комплекс NPK — слабый лист'
+    ELSE 'Не требуется';
+fertNeed (EquipmentUnit u) = isAgro(u) AND fertPlan(u) != 'Не требуется' AND fertPlan(u) != '';
+lowP (EquipmentUnit u) = isAgro(u) AND soilP(u) < 25.0;
+lowK (EquipmentUnit u) = isAgro(u) AND soilK(u) < 180.0;
+// удобрение по НАИБОЛЕЕ дефицитному элементу (не всё в карбамид)
+fertProd (EquipmentUnit u) = CASE
+    WHEN lowN(u) AND (lowP(u) OR lowK(u)) THEN 'NPK-комплекс'
+    WHEN lowN(u) THEN 'Карбамид (N 46%)'
+    WHEN lowP(u) THEN 'Суперфосфат (P)'
+    WHEN lowK(u) THEN 'Сульфат калия'
+    ELSE 'NPK-комплекс';
+// причина подбора удобрения (для аналитики)
+fertReason (EquipmentUnit u) = CASE
+    WHEN lowN(u) AND (lowP(u) OR lowK(u)) THEN 'дефицит N + ' + (IF lowP(u) THEN 'P' ELSE 'K')
+    WHEN lowN(u) THEN 'низкий N'
+    WHEN lowP(u) THEN 'низкий P (фосфор)'
+    WHEN lowK(u) THEN 'низкий K (калий)'
+    ELSE 'поддерживающее NPK';
+// препарат защиты по культуре (у каждой культуры своя болезнь → свой фунгицид)
+fungicideFor (EquipmentUnit u) = CASE
+    WHEN crop(u) = 'Виноград' THEN 'Ридомил Голд — милдью/оидиум'
+    WHEN crop(u) = 'Томаты (теплица)' THEN 'Ридомил + медь — фитофтороз'
+    WHEN crop(u) = 'Огурцы (теплица)' THEN 'Квадрис — пероноспороз'
+    WHEN crop(u) = 'Озимая пшеница' THEN 'Триазол — септориоз/ржавчина'
+    WHEN crop(u) = 'Кукуруза' THEN 'Триазол — гельминтоспориоз'
+    WHEN crop(u) = 'Подсолнечник' THEN 'Пиктор — фомоз/ЛМР'
+    WHEN crop(u) = 'Рапс' THEN 'Пиктор — склеротиниоз'
+    WHEN crop(u) = 'Соя' THEN 'Медь — пероноспороз'
+    WHEN crop(u) = 'Яблоневый сад' THEN 'Скор — парша/монилиоз'
+    WHEN crop(u) = 'Клубника' THEN 'Свитч — серая гниль'
+    ELSE 'Фунгицид (контактный)';
+seedVer 'версия демо-сида' = DATA INTEGER ();
+
+// ---- Журнал внесения удобрений ----
+CLASS Fertilization 'Внесение удобрения';
+TABLE fertilization (Fertilization);
+fUnit = DATA EquipmentUnit (Fertilization);
+fDate 'Дата' = DATA DATE (Fertilization);
+fProduct 'Удобрение' = DATA STRING[60] (Fertilization);
+fDoseKgHa 'Доза, кг/га' = DATA DOUBLE (Fertilization);
+fCost 'Стоимость, ₽' = DATA DOUBLE (Fertilization);
+nameFUnit 'Объект' (Fertilization f) = euName(fUnit(f));
+
+// ---- Склад удобрений/СЗР (на базе Spare из ERP) + витрина остатков в снимок ----
+isFertSpare 'Удобрение/СЗР (склад)' = DATA BOOLEAN (Spare);
+// F-запись остатка: agro3d её игнорирует (не 'U'), agrodash показывает склад/заявки
+fertStockRec (Spare s) = '~F^' + (OVERRIDE spareName(s), '') + '^' + (OVERRIDE ('' + spareQty(s)), '0') + '^' + (OVERRIDE ('' + spareMin(s)), '0') + '^' + (OVERRIDE ('' + sparePrice(s)), '0');
+fertStockData () = OVERRIDE (GROUP CONCAT fertStockRec(Spare s) IF isFertSpare(s), '' ORDER spareName(s), s), '';
+
+// ---- Партии удобрений/СЗР: приход/остаток/срок годности/поставщик (аналитика по партиям) ----
+CLASS FertBatch 'Партия удобрения/СЗР';
+TABLE fertBatch (FertBatch);
+fbSpare = DATA Spare (FertBatch);
+nameFbSpare 'Препарат' (FertBatch b) = spareName(fbSpare(b));
+fbNumber 'Партия №' = DATA STRING[24] (FertBatch);
+fbDate 'Поставка' = DATA DATE (FertBatch);
+fbQtyIn 'Приход, кг' = DATA NUMERIC[12,1] (FertBatch);
+fbRemain 'Остаток, кг' = DATA NUMERIC[12,1] (FertBatch);
+fbPrice 'Цена, ₽/кг' = DATA NUMERIC[10,2] (FertBatch);
+fbExpiry 'Годен до' = DATA DATE (FertBatch);
+fbSupplier 'Поставщик' = DATA STRING[40] (FertBatch);
+fBatch 'Партия' = DATA FertBatch (Fertilization);
+fbUsed 'Расход, кг' (FertBatch b) = (OVERRIDE fbQtyIn(b), 0.0) - (OVERRIDE fbRemain(b), 0.0);
+fbValue 'Стоимость остатка, ₽' (FertBatch b) = r0(NUMERIC[14,2]((OVERRIDE fbRemain(b), 0.0) * (OVERRIDE fbPrice(b), 0.0)));
+// B-запись партии в снимок: agro3d игнорирует (не 'U'), agrodash показывает аналитику по партиям.
+// Срок годности отдаём строкой (дд.мм.гггг) — дни до истечения считает клиент (без арифметики дат на сервере).
+batchRec (FertBatch b) = '~B^' + (OVERRIDE nameFbSpare(b), '') + '^' + (OVERRIDE fbNumber(b), '') + '^' + (OVERRIDE ('' + NUMERIC[10,0](fbQtyIn(b))), '0')
+    + '^' + (OVERRIDE ('' + NUMERIC[10,0](fbRemain(b))), '0') + '^' + (OVERRIDE ('' + fbExpiry(b)), '') + '^' + (OVERRIDE fbSupplier(b), '') + '^' + (OVERRIDE ('' + fbPrice(b)), '0');
+batchData () = OVERRIDE (GROUP CONCAT batchRec(FertBatch b), '' ORDER fbExpiry(b), b), '';
+
+// ── План дня: отметки «сделано сегодня» (для чек-листа задач) ──
+doneWater = DATA BOOLEAN (EquipmentUnit);
+doneTreat = DATA BOOLEAN (EquipmentUnit);
+doneFert = DATA BOOLEAN (EquipmentUnit);
+doneHarvest = DATA BOOLEAN (EquipmentUnit);
+
+// ── Заказы поставщику (ERP) по удобрениям/СЗР — витрина связи агро↔ERP ──
+isFertReq (PurchaseReq r) = isFertSpare(prSpare(r));
+orderRec (PurchaseReq r) = '~O^' + (OVERRIDE ('' + prNumber(r)), '') + '^' + (OVERRIDE namePrSpare(r), '') + '^' + (OVERRIDE ('' + prQty(r)), '0') + '^' + (OVERRIDE prStatus(r), '');
+orderData () = OVERRIDE (GROUP CONCAT orderRec(PurchaseReq r) IF isFertReq(r), '' ORDER prDate(r), r), '';
+
+// приёмка партии (пополнение склада поставкой)
+receiveBatch 'Приёмка партии' (Spare s) {
+    NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'ПРМ-' + (OVERRIDE ('' + spareQty(s)), '0'); fbDate(b) <- currentDate(); fbQtyIn(b) <- (OVERRIDE spareMin(s), 500.0) * 1.5; fbRemain(b) <- (OVERRIDE spareMin(s), 500.0) * 1.5; fbPrice(b) <- (OVERRIDE sparePrice(s), 50.0); fbExpiry(b) <- 2028_01_01; fbSupplier(b) <- 'Поставщик'; }
+    APPLY;
+}
+
+// ---- Связь с ERP: авто-заявка на удобрение (реальная PurchaseReq через Spare) ----
+requestFert (EquipmentUnit u) {
+    LOCAL sp = Spare ();
+    sp() <- spareByName(fertProd(u));
+    IF NOT sp() THEN { NEW s = Spare { spareName(s) <- fertProd(u); spareQty(s) <- 0; spareMin(s) <- 500; sparePrice(s) <- 45; sp() <- s; } }
+    isFertSpare(sp()) <- TRUE;
+    prSeq() <- (OVERRIDE prSeq(), 5000) + 1;
+    NEW r = PurchaseReq { prNumber(r) <- prSeq(); prDate(r) <- currentDateTime(); prSpare(r) <- sp(); prQty(r) <- INTEGER((OVERRIDE areaHa(u), 1.0) * 150.0); prStatus(r) <- 'создана'; }
+}
+requestFertAll 'Заявки в ERP на удобрения (где нужно)' () { FOR fertNeed(EquipmentUnit u) DO requestFert(u); APPLY; }
+
+// внесение со списанием из ближайшей доступной партии (+ авто-заявка при нехватке = дозаказ)
+logFertilize (EquipmentUnit u) {
+    LOCAL spB = Spare ();
+    spB() <- spareByName(fertProd(u));
+    LOCAL bb = FertBatch ();
+    bb() <- GROUP MAX FertBatch b IF fbSpare(b) = spB() AND fbRemain(b) > 0.0;
+    NEW f = Fertilization { fUnit(f) <- u; fDate(f) <- currentDate(); fProduct(f) <- fertProd(u); fDoseKgHa(f) <- 150.0; fCost(f) <- (OVERRIDE areaHa(u), 1.0) * 6750.0; fBatch(f) <- bb(); }
+    IF bb() THEN fbRemain(bb()) <- (OVERRIDE fbRemain(bb()), 0.0) - 150.0;
+    requestFert(u);   // авто-заявка в ERP на пополнение (дозаказ)
+    soilN(u) <- (OVERRIDE soilN(u), 20.0) + 12.0;
+    doneFert(u) <- TRUE;
+}
+
+nameFBatch 'Партия' (Fertilization f) = fbNumber(fBatch(f));
+FORM fertilizations 'Журнал удобрений'
+    OBJECTS f = Fertilization
+    PROPERTIES (f) READONLY nameFUnit, fDate, fProduct, fDoseKgHa, fCost, nameFBatch
+    PROPERTIES (f) DELETE
+    ORDERS fDate(f)
+;
+
+FORM fertBatches 'Партии удобрений/СЗР'
+    OBJECTS b = FertBatch
+    PROPERTIES (b) READONLY nameFbSpare, fbNumber, fbSupplier, fbDate, fbQtyIn, fbUsed, fbRemain, fbPrice, fbValue, fbExpiry
+    ORDERS fbExpiry(b)
+;
+
+// ===================== ВЛАГОБАЛАНС / ET0 (полив в мм) =====================
+tMean (EquipmentUnit u) = (OVERRIDE (fMinTemp(u) + fMaxTemp(u)) / 2.0, fNowTemp(u));
+// ET0 упрощённо (мм/сут): растёт с t° и ветром, падает с влажностью воздуха
+et0 'ET0, мм/сут' (EquipmentUnit u) = (OVERRIDE tMean(u), 15.0) * 0.22 + (OVERRIDE fMaxWind(u), 2.0) * 0.25 - (OVERRIDE airHum(u), 60.0) * 0.02;
+rainMm (EquipmentUnit u) = (OVERRIDE fMaxPrecip(u), 0) * 0.08;   // грубая оценка осадков, мм
+waterDeficit 'Дефицит влаги, мм' (EquipmentUnit u) = IF isAgro(u) AND (et0(u) - rainMm(u)) > 0.0 THEN (et0(u) - rainMm(u));
+irrigationMm 'Полить, мм' (EquipmentUnit u) = IF needIrrigation(u) THEN r0(NUMERIC[14,2](waterDeficit(u) * 5.0));
+
+// ===================== ФЕНОФАЗА + САТ (GDD) =====================
+sowDate 'Дата сева' = DATA DATE (EquipmentUnit);
+baseTemp 'Базовая t°' = DATA DOUBLE (EquipmentUnit);
+gddSum 'САТ, °C·сут' = DATA DOUBLE (EquipmentUnit);
+gddHarvest 'САТ до уборки' = DATA DOUBLE (EquipmentUnit);
+gddPct (EquipmentUnit u) = (OVERRIDE gddSum(u), 0.0) / (OVERRIDE gddHarvest(u), 1.0);
+// МАТЕРИАЛИЗУЕМ (IF-с-разными-строками → иначе взрыв в конкатенации сцены)
+growthStage 'Фаза' (EquipmentUnit u) =
+    (IF NOT isAgro(u) THEN ''
+    ELSE IF gddPct(u) >= 1.0 THEN 'Уборка'
+    ELSE IF gddPct(u) >= 0.7 THEN 'Созревание'
+    ELSE IF gddPct(u) >= 0.3 THEN 'Вегетация'
+    ELSE 'Всходы') MATERIALIZED;
+// growthCode/coverPct — DATA (заполняются refreshAgroScene), НЕ materialized-CASE: иначе пересчёт
+// записи agroRec переинлайнивает их CASE-деревья → 150с+ на часть (см. lsfusion-complex-property-preread-crash).
+growthCode = DATA INTEGER (EquipmentUnit);
+coverPct 'Покров/густота, %' = DATA INTEGER (EquipmentUnit);
+harvestReady (EquipmentUnit u) = isAgro(u) AND gddPct(u) >= 1.0;
+
+// ===================== ОКНО ПОЛЕВЫХ РАБОТ =====================
+sowWindow 'Окно сева' (EquipmentUnit u) = isAgro(u) AND hasForecast(u) AND (OVERRIDE fMaxPrecip(u), 0) <= 40 AND (OVERRIDE soilTemp(u), 0.0) >= 8.0 AND NOT frostRisk(u);
+harvestWindow 'Окно уборки' (EquipmentUnit u) = harvestReady(u) AND (OVERRIDE fMaxPrecip(u), 0) <= 30;
+
+// ===================== ЖУРНАЛ СЗР + СРОК ОЖИДАНИЯ (PHI) =====================
+CLASS Treatment 'Обработка СЗР';
+TABLE treatment (Treatment);
+trUnit = DATA EquipmentUnit (Treatment);
+trDate 'Дата' = DATA DATE (Treatment);
+trProduct 'Препарат' = DATA STRING[60] (Treatment);
+trPhi 'Срок ожидания, дн' = DATA INTEGER (Treatment);
+nameTrUnit 'Объект' (Treatment t) = euName(trUnit(t));
+phiUntilT (Treatment t) = trDate(t) + trPhi(t);
+lastTreatment (EquipmentUnit u) = GROUP LAST Treatment t ORDER trDate(t), t WHERE trUnit(t) = u;
+phiUntil 'Ждать до (PHI)' (EquipmentUnit u) = phiUntilT(lastTreatment(u));
+phiBlocked 'Нельзя убирать' (EquipmentUnit u) = phiUntil(u) AND phiUntil(u) > currentDate();
+addTreatment 'Внести обработку' (EquipmentUnit u) {
+    NEW t = Treatment { trUnit(t) <- u; trDate(t) <- currentDate(); trProduct(t) <- fungicideFor(u); trPhi(t) <- 20; }
+    APPLY;
+}
+FORM treatments 'Журнал обработок (СЗР)'
+    OBJECTS t = Treatment
+    PROPERTIES (t) READONLY nameTrUnit, trDate, trProduct, trPhi
+    PROPERTIES (t) DELETE
+    ORDERS trDate(t)
+;
+
+recommendation 'Рекомендация' (EquipmentUnit u) =
+    IF NOT isAgro(u) THEN ''
+    ELSE IF NOT hasForecast(u) THEN 'Нет прогноза — обновите погоду'
+    ELSE IF frostRisk(u) THEN 'Заморозок ночью — укрыть / обогрев'
+    ELSE IF hasDisease(u) THEN 'ИИ: ' + leafDisease(u) + ' — обработка фунгицидом'
+    ELSE IF harvestReady(u) AND phiBlocked(u) THEN 'Созрело, но действует срок ожидания СЗР — убирать нельзя'
+    ELSE IF harvestWindow(u) THEN 'Созрело, сухо — окно уборки'
+    ELSE IF rainSoon(u) AND isDry(u) THEN 'Ожидается дождь — полив отложить'
+    ELSE IF needIrrigation(u) THEN 'Сухо — полить (' + (OVERRIDE ('' + irrigationMm(u)), '') + ' мм)'
+    ELSE IF fertNeed(u) THEN 'Питание: ' + fertPlan(u)
+    ELSE IF diseaseRisk(u) THEN 'Лист мокрый, влажно — риск болезни, проветривание'
+    ELSE IF sprayWindow(u) THEN 'Тихо и сухо — окно для опрыскивания'
+    ELSE 'В норме';
+
+// ===================== Итоги =====================
+agroCount () = GROUP SUM 1 IF isAgro(EquipmentUnit u);
+totalArea () = GROUP SUM areaHa(EquipmentUnit u) IF isAgro(u);
+frostN () = GROUP SUM 1 IF frostRisk(EquipmentUnit u);
+irrigateN () = GROUP SUM 1 IF needIrrigation(EquipmentUnit u);
+diseaseN () = GROUP SUM 1 IF diseaseRisk(EquipmentUnit u);
+totalAtRisk () = GROUP SUM frostRiskRub(EquipmentUnit u);
+totalSaved () = GROUP SUM savedRub(EquipmentUnit u);
+
+agroKpi 'Агро — сейчас' () = HTML(
+    '<div style="font-family:sans-serif;padding:12px 14px">'
+  + '<div style="font-size:15px;font-weight:700;color:#222;margin-bottom:10px">Агро-объекты и погода — сейчас</div>'
+  + '<div style="display:flex;gap:20px;flex-wrap:wrap">'
+    + '<div><div style="font-size:11px;color:#8a93a0">Объектов</div><div style="font-size:22px;font-weight:800;color:#2b6cb0">' + (OVERRIDE ('' + agroCount()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Площадь</div><div style="font-size:22px;font-weight:800;color:#222">' + (OVERRIDE ('' + r0(NUMERIC[14,2](totalArea()))), '0') + ' га</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Риск заморозка</div><div style="font-size:22px;font-weight:800;color:#b3261e">' + (OVERRIDE ('' + frostN()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Нужен полив</div><div style="font-size:22px;font-weight:800;color:#b07400">' + (OVERRIDE ('' + irrigateN()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Риск болезни</div><div style="font-size:22px;font-weight:800;color:#8a5a00">' + (OVERRIDE ('' + diseaseN()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Под угрозой</div><div style="font-size:22px;font-weight:800;color:#b3261e">' + (OVERRIDE ('' + totalAtRisk()), '0') + ' ₽</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Экономия</div><div style="font-size:22px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + totalSaved()), '0') + ' ₽</div></div>'
+  + '</div></div>');
+
+// ===================== 3D-СЦЕНА «Ферма» (agro3d) =====================
+// ВАЖНО: в запись кладём только ПРОСТЫЕ хранимые значения (sim-датчики + прогноз + пороги + координаты),
+// БЕЗ вложенных OVERRIDE/CASE (recommendation/leafDisease/status) — иначе SQL-конкатенация взрывается
+// (см. память lsfusion-scene-data-sql-explosion). Болезнь/качество/статус/рекомендацию СИНТЕЗИРУЕТ КЛИЕНТ (agro3d.js).
+diseaseAiN () = GROUP SUM 1 IF hasDisease(EquipmentUnit u);
+// МАТЕРИАЛИЗУЕМ CASE-хелперы: иначе CASE в конкатенации записи дублирует всю строку по каждой ветке → SQL взрыв (TOO LONG QUERY)
+// sceneType/sceneX/sceneZ — DATA (заполняются refreshAgroScene), НЕ materialized-CASE (см. выше).
+sceneType 'Тип сцены' = DATA STRING (EquipmentUnit);
+sceneX 'X сцены' = DATA INTEGER (EquipmentUnit);
+sceneZ 'Z сцены' = DATA INTEGER (EquipmentUnit);
+
+// Запись юнита — DATA-строка, СТРОИТСЯ ИМПЕРАТИВНО в refreshAgroScene (цикл по 5 агро-юнитам,
+// 3 чанка по 7 полей = маленький SQL на 5 строк). НЕ materialized и НЕ один большой GROUP CONCAT:
+// оба варианта разворачивают 21 nullable-OVERRIDE операнд в мегабайтный SQL / 168с-пересчёт по всей
+// таблице EquipmentUnit (тысячи юнитов твина). См. lsfusion-scene-data-sql-explosion + complex-property-preread-crash.
+// agroData затем линейно агрегирует эту DATA-строку (STRING_AGG). Поля (для парсера agro3d/agrodash):
+// 1name 2type 3crop 4site 5airT 6airH 7soilM | 8soilT 9leafW 10soilMin 11frostThr 12px 13pz 14gcode | 15cover 16area 17cropVal 18soilN 19nMin 20gdd 21gddH
+unitRecStr = DATA STRING (EquipmentUnit);
+// глобальная сводка прогноза (3 скаляра, считаются ОДИН раз) — климат площадок близкий, клиент применяет ко всем
+gMinT () = GROUP MIN temperature(WeatherForecast f) IF inHorizon(f);
+gNowT () = GROUP MAX temperature(WeatherForecast f) IF inHorizon(f);
+gPrecip () = GROUP MAX precipitation(WeatherForecast f) IF inHorizon(f);
+
+agroData 'Ферма 3D' () = 'A^' + (OVERRIDE ('' + agroCount()), '0') + '^' + (OVERRIDE ('' + r0(NUMERIC[14,2](totalArea()))), '0')
+    + '^' + (OVERRIDE ('' + NUMERIC[6,0](gNowT())), '') + '^' + (OVERRIDE ('' + NUMERIC[6,0](gMinT())), '') + '^' + (OVERRIDE ('' + gPrecip()), '')
+    + '~' + (OVERRIDE (GROUP CONCAT unitRecStr(EquipmentUnit u) IF isAgro(u), '~' ORDER euName(u), u), '') + fertStockData() + batchData() + orderData() NOCOMPLEX NOHINT;
+// тот же снимок в аналитический дашборд (agrodash)
+agroDashData 'Агро — аналитика' () = agroData() NOCOMPLEX NOHINT;
+
+// Пересобирает снимок сцены для 5 агро-юнитов: сперва DATA-производные (тип/позиция/фаза/покров),
+// затем строку записи unitRecStr — 3 чанками по 7 полей (каждый чанк — маленький concat на 5 строк → быстро).
+// Так снимок строится ИМПЕРАТИВНО (без материализации/большого GROUP CONCAT), agroData агрегирует линейно.
+// Вызывается на старте и после каждого действия (harvest меняет gddSum → фаза/покров/запись обновляются).
+refreshAgroScene () {
+    FOR isAgro(EquipmentUnit u) DO {
+        sceneType(u) <- (CASE WHEN nameEuType(u) = 'Теплица' THEN 'greenhouse' WHEN nameEuType(u) = 'Грядка' THEN 'beds' WHEN nameEuType(u) = 'Дерево (сад)' THEN 'orchard' ELSE 'field');
+        sceneX(u) <- (CASE WHEN euName(u) = 'Грядки овощные' THEN 100 WHEN euName(u) = 'Теплица томаты' THEN 0 WHEN euName(u) = 'Поле кукурузы' THEN 300 WHEN euName(u) = 'Сад яблоневый' THEN 410 ELSE 0);
+        sceneZ(u) <- (CASE WHEN euName(u) = 'Теплица томаты' THEN 100 WHEN euName(u) = 'Грядки овощные' THEN 100 ELSE 0);
+        growthCode(u) <- (CASE WHEN gddPct(u) >= 1.0 THEN 3 WHEN gddPct(u) >= 0.7 THEN 2 WHEN gddPct(u) >= 0.3 THEN 1 ELSE 0);
+        coverPct(u) <- INTEGER(10 + gddPct(u) * 85);
+    }
+    // запись 3 чанками (поля 1-7 | 8-14 | 15-21); OVERRIDE-дефолты на случай null
+    FOR isAgro(EquipmentUnit u) DO {
+        unitRecStr(u) <- 'U^' + (OVERRIDE euName(u), '') + '^' + (OVERRIDE sceneType(u), 'field') + '^' + (OVERRIDE crop(u), '') + '^' + (OVERRIDE nameAgroSite(u), '')
+            + '^' + (OVERRIDE ('' + NUMERIC[6,1](simAirTemp(u))), '0') + '^' + (OVERRIDE ('' + NUMERIC[6,0](simAirHum(u))), '0') + '^' + (OVERRIDE ('' + NUMERIC[6,0](simSoilMoist(u))), '0');
+        unitRecStr(u) <- (OVERRIDE unitRecStr(u), '') + '^' + (OVERRIDE ('' + NUMERIC[6,1](simSoilTemp(u))), '0') + '^' + (OVERRIDE ('' + NUMERIC[6,0](simLeafWet(u))), '0')
+            + '^' + (OVERRIDE ('' + NUMERIC[6,0](soilMoistMin(u))), '30') + '^' + (OVERRIDE ('' + NUMERIC[6,1](frostThreshold(u))), '0')
+            + '^' + (OVERRIDE ('' + sceneX(u)), '0') + '^' + (OVERRIDE ('' + sceneZ(u)), '0') + '^' + (OVERRIDE ('' + growthCode(u)), '0');
+        unitRecStr(u) <- (OVERRIDE unitRecStr(u), '') + '^' + (OVERRIDE ('' + coverPct(u)), '0')
+            + '^' + (OVERRIDE ('' + NUMERIC[8,0](areaHa(u))), '0') + '^' + (OVERRIDE ('' + NUMERIC[10,0](cropValueHa(u))), '0')
+            + '^' + (OVERRIDE ('' + NUMERIC[6,0](soilN(u))), '0') + '^' + (OVERRIDE ('' + NUMERIC[6,0](nMin(u))), '30')
+            + '^' + (OVERRIDE ('' + NUMERIC[8,0](gddSum(u))), '0') + '^' + (OVERRIDE ('' + NUMERIC[8,0](gddHarvest(u))), '1500');
+        // 4-й чанк: отметки «сделано сегодня» (поля 22-25) для чек-листа плана дня
+        unitRecStr(u) <- (OVERRIDE unitRecStr(u), '') + '^' + (IF doneWater(u) THEN '1' ELSE '0') + '^' + (IF doneTreat(u) THEN '1' ELSE '0')
+            + '^' + (IF doneFert(u) THEN '1' ELSE '0') + '^' + (IF doneHarvest(u) THEN '1' ELSE '0')
+            + '^' + (OVERRIDE fertProd(u), '') + '^' + (OVERRIDE fertReason(u), '');
+    }
+    APPLY;
+}
+
+// ---- Журнал облётов дрона (фото крон → ИИ-распознавание) ----
+CLASS DroneScan 'Облёт дрона (фото)';
+TABLE droneScan (DroneScan);
+dsUnit = DATA EquipmentUnit (DroneScan);
+dsDate 'Дата' = DATA DATE (DroneScan);
+dsCanopy 'Крона/покров, %' = DATA INTEGER (DroneScan);
+dsLeafQ 'Качество листа, %' = DATA INTEGER (DroneScan);
+dsDisease 'Распознано (ИИ)' = DATA STRING[60] (DroneScan);
+nameDsUnit 'Объект' (DroneScan d) = euName(dsUnit(d));
+FORM droneScans 'Журнал облётов дрона (фото крон)'
+    OBJECTS d = DroneScan
+    PROPERTIES (d) READONLY nameDsUnit, dsDate, dsCanopy, dsLeafQ, dsDisease
+    PROPERTIES (d) DELETE
+    ORDERS dsDate(d)
+;
+
+lightOn 'Свет вкл.' = DATA BOOLEAN (EquipmentUnit);
+ventOn 'Проветривание' = DATA BOOLEAN (EquipmentUnit);
+// клик по объекту в сцене → действие (полить/обработать/проветрить/свет/убрать/удобрить)
+onAgroEvent () {
+    INPUT j = JSON DO {
+        IMPORT JSON FROM j FIELDS() STRING action, STRING objName DO {
+            FOR euName(EquipmentUnit u) = objName DO {
+                IF action = 'water' THEN { simSoilMoist(u) <- (OVERRIDE simSoilMoist(u), 0.0) + 20.0; doneWater(u) <- TRUE; }
+                IF action = 'treat' THEN {
+                    simLeafWet(u) <- 10.0;   // обработали → лист подсох → болезнь уходит (авто-ИИ)
+                    NEW t = Treatment { trUnit(t) <- u; trDate(t) <- currentDate(); trProduct(t) <- fungicideFor(u); trPhi(t) <- 20; }
+                    doneTreat(u) <- TRUE;
+                }
+                IF action = 'vent' THEN { ventOn(u) <- TRUE; simAirHum(u) <- (OVERRIDE simAirHum(u), 60.0) - 20.0; simLeafWet(u) <- (OVERRIDE simLeafWet(u), 30.0) - 20.0; }
+                IF action = 'light' THEN lightOn(u) <- NOT lightOn(u);
+                IF action = 'harvest' THEN { gddSum(u) <- 100.0; doneHarvest(u) <- TRUE; }   // убрали → новый цикл (фаза «Всходы»)
+                IF action = 'fertilize' THEN logFertilize(u);   // внесение + списание из партии + дозаказ
+                IF action = 'scan' THEN {   // фото дрона → ИИ-распознавание кроны/листа → в журнал облётов
+                    NEW ds = DroneScan { dsUnit(ds) <- u; dsDate(ds) <- currentDate(); dsCanopy(ds) <- coverPct(u); dsLeafQ(ds) <- INTEGER(leafQuality(u)); dsDisease(ds) <- (OVERRIDE leafDisease(u), 'здоров'); }
+                }
+            }
+        }
+    }
+    refreshAgroScene();   // применяет изменения + пересчитывает тип/позицию/фазу/покров в DATA
+}
+
+// сцена + аналитика НА ОДНОЙ странице (данные лёгкие/императивные, RAM 8ГБ — двойного чтения не боимся)
+FORM agroScene 'Ферма — 3D'
+    PROPERTIES () agroData CUSTOM 'agro3d' ON CHANGE onAgroEvent()
+    PROPERTIES () agroDashData CUSTOM 'agrodash'
+;
+DESIGN agroScene {
+    OBJECTS {
+        MOVE PROPERTY(agroData()) { fill = 3; caption = ''; }
+        MOVE PROPERTY(agroDashData()) { fill = 1; caption = ''; }
+    }
+}
+
+// настройки погоды — КЛЮЧ ЗДЕСЬ (не на сцене)
+FORM agroSettings 'Настройки погоды'
+    PROPERTIES () owmApiKey, updateWeatherAll
+;
+
+// ===================== Демо-управление почвой =====================
+waterUnit 'Полить (+15%)' (EquipmentUnit u) { simSoilMoist(u) <- (OVERRIDE simSoilMoist(u), 0.0) + 15.0; APPLY; }
+dryUnit 'Подсушить (−15%)' (EquipmentUnit u) { simSoilMoist(u) <- (OVERRIDE simSoilMoist(u), 15.0) - 15.0; APPLY; }
+
+// ===================== Дашборд =====================
+FORM agroDashboard 'Агро — объекты и погода'
+    PROPERTIES () agroKpi
+
+    OBJECTS u = EquipmentUnit
+    PROPERTIES (u) READONLY euName, nameEuType, crop, nameAgroSite, areaHa
+    PROPERTIES (u) READONLY airTemp, airHum, soilMoist, soilTemp, leafWet
+    PROPERTIES (u) READONLY leafQuality, leafDisease
+    PROPERTIES (u) READONLY fNowTemp, fMinTemp, fMaxPrecip, fMaxWind
+    PROPERTIES (u) READONLY growthStage, waterDeficit, irrigationMm, fertPlan, phiUntil
+    PROPERTIES (u) READONLY recommendation, frostRiskRub, savedRub, euSource, nameEuDevice
+    PROPERTIES (u) addTreatment
+    FILTERS isAgro(u)
+    ORDERS euName(u)
+
+    OBJECTS f = WeatherForecast
+    PROPERTIES (f) READONLY time, temperature, feelsLike, humidity, precipitation, windSpeed, conditionName
+    FILTERS location(f) = agroSite(u) AND inHorizon(f)
+    ORDERS time(f)
+;
+
+DESIGN agroDashboard {
+    OBJECTS {
+        MOVE PROPERTY(agroKpi());
+        MOVE BOX(u) { caption = 'Агро-объекты · датчики (воздух/почва/лист) · прогноз · рекомендация'; fill = 3; }
+        MOVE BOX(f) { caption = 'Прогноз по площадке выбранного объекта (сутки, шаг 3 ч)'; fill = 2; }
+    }
+}
+
+// ===================== Навигатор =====================
+NAVIGATOR {
+    // Агро — самодостаточный кейс: сцена + данные + погода в одной папке (agroFolder объявлена в Base)
+    agroFolder {
+        NEW agroScene;                   // Ферма (3D) + аналитика
+        NEW FOLDER agroDataFolder 'Агро-данные' {
+            NEW agroDashboard;
+            NEW fertilizations;
+            NEW fertBatches;
+            NEW treatments;
+            NEW droneScans;
+        }
+        NEW FOLDER weatherFolder 'Погода' {
+            NEW weatherForecasts;
+            NEW agroSettings;
+        }
+    }
+}
+
+onWebClientInit() + { onWebClientInit('agro3d.js') <- 13; onWebClientInit('agrodash.js') <- 14; }
+
+// ===================== Демо-данные =====================
+// сид агро-объектов при старте (как twin.seedUnits): создаём типы «Поле»/«Теплица», площадки, юниты
+agroSeed 'Засеять агро-демо' () {
+    IF NOT (GROUP MAX EquipmentType e IF etName(e) = 'Поле') THEN NEW e = EquipmentType { etName(e) <- 'Поле'; etShape(e) <- 'plot'; etLenM(e) <- 80.0; etWidM(e) <- 40.0; etHeM(e) <- 0.1; etColor(e) <- '#7a9a3a'; }
+    IF NOT (GROUP MAX EquipmentType e IF etName(e) = 'Теплица') THEN NEW e = EquipmentType { etName(e) <- 'Теплица'; etShape(e) <- 'box'; etLenM(e) <- 12.0; etWidM(e) <- 5.0; etHeM(e) <- 3.0; etColor(e) <- '#8fbf7a'; }
+    APPLY;
+
+    IF NOT (GROUP SUM 1 IF isAgro(EquipmentUnit u)) THEN {
+        // площадки (Location = координаты + погода)
+        NEW s1 = Location { name(s1) <- 'Агроплощадка «Кубань»'; latitude(s1) <- 45.040000; longitude(s1) <- 38.976000; }
+        NEW s2 = Location { name(s2) <- 'Агроплощадка «Дон»';   latitude(s2) <- 47.235000; longitude(s2) <- 39.701000; }
+        APPLY;
+
+        // объекты на площадках (EquipmentUnit штатного механизма) + агро-атрибуты + демо-показатели
+        FOR name(Location s) = 'Агроплощадка «Кубань»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле озимой пшеницы'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Кубань'; euIndex(u) <- 201; euPosX(u) <- 0.0; euPosZ(u) <- 0.0; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000; euSource(u) <- 'sim';
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Озимая пшеница'; areaHa(u) <- 120.0; cropValueHa(u) <- 95000.0; frostThreshold(u) <- -3.0; soilMoistMin(u) <- 30.0; irrigationCostHa(u) <- 1500.0; frostLossShare(u) <- 0.25;
+                simAirTemp(u) <- 24.0; simAirHum(u) <- 55.0; simSoilMoist(u) <- 22.0; simSoilTemp(u) <- 21.0; simLeafWet(u) <- 20.0; }
+            NEW u = EquipmentUnit { euName(u) <- 'Грядки овощные'; euScope(u) <- 'agro'; euType(u) <- typeByName('Грядка'); euGroup(u) <- 'Кубань'; euIndex(u) <- 202; euPosX(u) <- 30.0; euPosZ(u) <- 10.0; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000; euSource(u) <- 'sim';
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Овощи (открытый грунт)'; areaHa(u) <- 3.0; cropValueHa(u) <- 400000.0; frostThreshold(u) <- 1.0; soilMoistMin(u) <- 40.0; irrigationCostHa(u) <- 6000.0; frostLossShare(u) <- 0.35;
+                simAirTemp(u) <- 24.0; simAirHum(u) <- 60.0; simSoilMoist(u) <- 33.0; simSoilTemp(u) <- 22.0; simLeafWet(u) <- 35.0; }
+            NEW u = EquipmentUnit { euName(u) <- 'Теплица томаты'; euScope(u) <- 'agro'; euType(u) <- typeByName('Теплица'); euGroup(u) <- 'Кубань'; euIndex(u) <- 203; euPosX(u) <- -25.0; euPosZ(u) <- 12.0; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000; euSource(u) <- 'sim';
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Томаты (теплица)'; areaHa(u) <- 0.5; cropValueHa(u) <- 2500000.0; frostThreshold(u) <- 5.0; soilMoistMin(u) <- 50.0; irrigationCostHa(u) <- 15000.0; frostLossShare(u) <- 0.40;
+                simAirTemp(u) <- 27.0; simAirHum(u) <- 88.0; simSoilMoist(u) <- 58.0; simSoilTemp(u) <- 24.0; simLeafWet(u) <- 70.0; }
+        }
+        FOR name(Location s) = 'Агроплощадка «Дон»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле кукурузы'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Дон'; euIndex(u) <- 204; euPosX(u) <- 0.0; euPosZ(u) <- 0.0; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000; euSource(u) <- 'sim';
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Кукуруза'; areaHa(u) <- 90.0; cropValueHa(u) <- 110000.0; frostThreshold(u) <- 2.0; soilMoistMin(u) <- 32.0; irrigationCostHa(u) <- 1800.0; frostLossShare(u) <- 0.30;
+                simAirTemp(u) <- 22.0; simAirHum(u) <- 62.0; simSoilMoist(u) <- 21.0; simSoilTemp(u) <- 20.0; simLeafWet(u) <- 25.0; }
+            NEW u = EquipmentUnit { euName(u) <- 'Сад яблоневый'; euScope(u) <- 'agro'; euType(u) <- typeByName('Дерево (сад)'); euGroup(u) <- 'Дон'; euIndex(u) <- 205; euPosX(u) <- 40.0; euPosZ(u) <- 15.0; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000; euSource(u) <- 'sim';
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Яблоневый сад'; areaHa(u) <- 40.0; cropValueHa(u) <- 300000.0; frostThreshold(u) <- 0.0; soilMoistMin(u) <- 35.0; irrigationCostHa(u) <- 2500.0; frostLossShare(u) <- 0.45;
+                simAirTemp(u) <- 22.0; simAirHum(u) <- 70.0; simSoilMoist(u) <- 38.0; simSoilTemp(u) <- 19.0; simLeafWet(u) <- 45.0; }
+        }
+        APPLY;
+    }
+    // агрономические поля (NPK, САТ, дата сева) — ОТДЕЛЬНЫЙ guard: юниты могли быть засеяны раньше без них
+    IF (GROUP SUM 1 IF isAgro(EquipmentUnit u)) AND NOT (GROUP SUM 1 IF soilN(EquipmentUnit u)) THEN {
+        FOR isAgro(EquipmentUnit u) DO { soilN(u) <- 27.0; soilP(u) <- 32.0; soilK(u) <- 210.0; nMin(u) <- 30.0; baseTemp(u) <- 8.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 950.0; sowDate(u) <- 2026_04_01; }
+        FOR euName(EquipmentUnit u) = 'Поле озимой пшеницы' DO { soilN(u) <- 22.0; gddSum(u) <- 1460.0; }
+        FOR euName(EquipmentUnit u) = 'Поле кукурузы' DO { soilN(u) <- 24.0; gddSum(u) <- 700.0; }
+        APPLY;
+    }
+    // +6 делянок (второй заход): создаём, только если их ещё нет; NPK/САТ инлайн (guard soilN их не заполнит)
+    IF NOT (GROUP MAX EquipmentUnit u IF euName(u) = 'Поле подсолнечника') THEN {
+        FOR name(Location s) = 'Агроплощадка «Кубань»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле подсолнечника'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Кубань'; euIndex(u) <- 206; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Подсолнечник'; areaHa(u) <- 85.0; cropValueHa(u) <- 105000.0; frostThreshold(u) <- 1.0; soilMoistMin(u) <- 30.0; irrigationCostHa(u) <- 1600.0; frostLossShare(u) <- 0.25;
+                simAirTemp(u) <- 26.0; simAirHum(u) <- 58.0; simSoilMoist(u) <- 24.0; simSoilTemp(u) <- 22.0; simLeafWet(u) <- 20.0;
+                soilN(u) <- 25.0; soilP(u) <- 30.0; soilK(u) <- 200.0; nMin(u) <- 30.0; baseTemp(u) <- 8.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1200.0; sowDate(u) <- 2026_04_15; }
+            NEW u = EquipmentUnit { euName(u) <- 'Теплица огурцы'; euScope(u) <- 'agro'; euType(u) <- typeByName('Теплица'); euGroup(u) <- 'Кубань'; euIndex(u) <- 207; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Огурцы (теплица)'; areaHa(u) <- 0.4; cropValueHa(u) <- 2100000.0; frostThreshold(u) <- 5.0; soilMoistMin(u) <- 50.0; irrigationCostHa(u) <- 14000.0; frostLossShare(u) <- 0.40;
+                simAirTemp(u) <- 28.0; simAirHum(u) <- 90.0; simSoilMoist(u) <- 60.0; simSoilTemp(u) <- 25.0; simLeafWet(u) <- 66.0;
+                soilN(u) <- 34.0; soilP(u) <- 40.0; soilK(u) <- 240.0; nMin(u) <- 30.0; baseTemp(u) <- 10.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 950.0; sowDate(u) <- 2026_03_20; }
+            NEW u = EquipmentUnit { euName(u) <- 'Виноградник'; euScope(u) <- 'agro'; euType(u) <- typeByName('Дерево (сад)'); euGroup(u) <- 'Кубань'; euIndex(u) <- 208; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Виноград'; areaHa(u) <- 25.0; cropValueHa(u) <- 450000.0; frostThreshold(u) <- 0.0; soilMoistMin(u) <- 33.0; irrigationCostHa(u) <- 3000.0; frostLossShare(u) <- 0.45;
+                simAirTemp(u) <- 25.0; simAirHum(u) <- 65.0; simSoilMoist(u) <- 30.0; simSoilTemp(u) <- 21.0; simLeafWet(u) <- 40.0;
+                soilN(u) <- 26.0; soilP(u) <- 32.0; soilK(u) <- 210.0; nMin(u) <- 30.0; baseTemp(u) <- 8.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1100.0; sowDate(u) <- 2026_04_01; }
+        }
+        FOR name(Location s) = 'Агроплощадка «Дон»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле сои'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Дон'; euIndex(u) <- 209; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Соя'; areaHa(u) <- 70.0; cropValueHa(u) <- 120000.0; frostThreshold(u) <- 2.0; soilMoistMin(u) <- 34.0; irrigationCostHa(u) <- 1900.0; frostLossShare(u) <- 0.30;
+                simAirTemp(u) <- 23.0; simAirHum(u) <- 60.0; simSoilMoist(u) <- 20.0; simSoilTemp(u) <- 20.0; simLeafWet(u) <- 22.0;
+                soilN(u) <- 28.0; soilP(u) <- 33.0; soilK(u) <- 205.0; nMin(u) <- 30.0; baseTemp(u) <- 9.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1350.0; sowDate(u) <- 2026_04_20; }
+            NEW u = EquipmentUnit { euName(u) <- 'Грядки клубники'; euScope(u) <- 'agro'; euType(u) <- typeByName('Грядка'); euGroup(u) <- 'Дон'; euIndex(u) <- 210; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Клубника'; areaHa(u) <- 4.0; cropValueHa(u) <- 700000.0; frostThreshold(u) <- 1.0; soilMoistMin(u) <- 42.0; irrigationCostHa(u) <- 6500.0; frostLossShare(u) <- 0.35;
+                simAirTemp(u) <- 22.0; simAirHum(u) <- 68.0; simSoilMoist(u) <- 36.0; simSoilTemp(u) <- 19.0; simLeafWet(u) <- 46.0;
+                soilN(u) <- 24.0; soilP(u) <- 31.0; soilK(u) <- 220.0; nMin(u) <- 30.0; baseTemp(u) <- 7.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 700.0; sowDate(u) <- 2026_04_05; }
+            NEW u = EquipmentUnit { euName(u) <- 'Поле рапса'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Дон'; euIndex(u) <- 211; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Рапс'; areaHa(u) <- 60.0; cropValueHa(u) <- 90000.0; frostThreshold(u) <- -1.0; soilMoistMin(u) <- 31.0; irrigationCostHa(u) <- 1700.0; frostLossShare(u) <- 0.28;
+                simAirTemp(u) <- 24.0; simAirHum(u) <- 55.0; simSoilMoist(u) <- 26.0; simSoilTemp(u) <- 20.0; simLeafWet(u) <- 20.0;
+                soilN(u) <- 23.0; soilP(u) <- 29.0; soilK(u) <- 195.0; nMin(u) <- 30.0; baseTemp(u) <- 5.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1500.0; sowDate(u) <- 2025_09_10; }
+        }
+        APPLY;
+    }
+    // +7 делянок (третий заход) — заполнить пустые места на сцене
+    IF NOT (GROUP MAX EquipmentUnit u IF euName(u) = 'Поле ячменя') THEN {
+        FOR name(Location s) = 'Агроплощадка «Кубань»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле ячменя'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Кубань'; euIndex(u) <- 212; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Ячмень'; areaHa(u) <- 75.0; cropValueHa(u) <- 88000.0; frostThreshold(u) <- -2.0; soilMoistMin(u) <- 30.0; irrigationCostHa(u) <- 1500.0; frostLossShare(u) <- 0.25;
+                simAirTemp(u) <- 25.0; simAirHum(u) <- 56.0; simSoilMoist(u) <- 25.0; simSoilTemp(u) <- 21.0; simLeafWet(u) <- 20.0;
+                soilN(u) <- 26.0; soilP(u) <- 31.0; soilK(u) <- 205.0; nMin(u) <- 30.0; baseTemp(u) <- 6.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1300.0; sowDate(u) <- 2026_03_25; }
+            NEW u = EquipmentUnit { euName(u) <- 'Теплица перец'; euScope(u) <- 'agro'; euType(u) <- typeByName('Теплица'); euGroup(u) <- 'Кубань'; euIndex(u) <- 213; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Перец (теплица)'; areaHa(u) <- 0.5; cropValueHa(u) <- 2300000.0; frostThreshold(u) <- 6.0; soilMoistMin(u) <- 50.0; irrigationCostHa(u) <- 14000.0; frostLossShare(u) <- 0.40;
+                simAirTemp(u) <- 27.0; simAirHum(u) <- 90.0; simSoilMoist(u) <- 60.0; simSoilTemp(u) <- 25.0; simLeafWet(u) <- 66.0;
+                soilN(u) <- 33.0; soilP(u) <- 40.0; soilK(u) <- 240.0; nMin(u) <- 30.0; baseTemp(u) <- 10.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 900.0; sowDate(u) <- 2026_03_18; }
+            NEW u = EquipmentUnit { euName(u) <- 'Грядки моркови'; euScope(u) <- 'agro'; euType(u) <- typeByName('Грядка'); euGroup(u) <- 'Кубань'; euIndex(u) <- 214; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Морковь'; areaHa(u) <- 5.0; cropValueHa(u) <- 350000.0; frostThreshold(u) <- 0.0; soilMoistMin(u) <- 40.0; irrigationCostHa(u) <- 6000.0; frostLossShare(u) <- 0.30;
+                simAirTemp(u) <- 24.0; simAirHum(u) <- 62.0; simSoilMoist(u) <- 34.0; simSoilTemp(u) <- 21.0; simLeafWet(u) <- 30.0;
+                soilN(u) <- 25.0; soilP(u) <- 30.0; soilK(u) <- 215.0; nMin(u) <- 30.0; baseTemp(u) <- 7.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 800.0; sowDate(u) <- 2026_04_08; }
+            NEW u = EquipmentUnit { euName(u) <- 'Черешневый сад'; euScope(u) <- 'agro'; euType(u) <- typeByName('Дерево (сад)'); euGroup(u) <- 'Кубань'; euIndex(u) <- 215; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Черешня'; areaHa(u) <- 22.0; cropValueHa(u) <- 420000.0; frostThreshold(u) <- 0.0; soilMoistMin(u) <- 34.0; irrigationCostHa(u) <- 2800.0; frostLossShare(u) <- 0.45;
+                simAirTemp(u) <- 24.0; simAirHum(u) <- 66.0; simSoilMoist(u) <- 32.0; simSoilTemp(u) <- 20.0; simLeafWet(u) <- 42.0;
+                soilN(u) <- 26.0; soilP(u) <- 32.0; soilK(u) <- 210.0; nMin(u) <- 30.0; baseTemp(u) <- 8.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1050.0; sowDate(u) <- 2026_04_01; }
+        }
+        FOR name(Location s) = 'Агроплощадка «Дон»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле гречихи'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Дон'; euIndex(u) <- 216; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Гречиха'; areaHa(u) <- 55.0; cropValueHa(u) <- 130000.0; frostThreshold(u) <- 2.0; soilMoistMin(u) <- 32.0; irrigationCostHa(u) <- 1800.0; frostLossShare(u) <- 0.30;
+                simAirTemp(u) <- 23.0; simAirHum(u) <- 60.0; simSoilMoist(u) <- 24.0; simSoilTemp(u) <- 20.0; simLeafWet(u) <- 22.0;
+                soilN(u) <- 27.0; soilP(u) <- 32.0; soilK(u) <- 205.0; nMin(u) <- 30.0; baseTemp(u) <- 8.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 1150.0; sowDate(u) <- 2026_05_01; }
+            NEW u = EquipmentUnit { euName(u) <- 'Теплица зелень'; euScope(u) <- 'agro'; euType(u) <- typeByName('Теплица'); euGroup(u) <- 'Дон'; euIndex(u) <- 217; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Зелень (теплица)'; areaHa(u) <- 0.3; cropValueHa(u) <- 1900000.0; frostThreshold(u) <- 5.0; soilMoistMin(u) <- 50.0; irrigationCostHa(u) <- 13000.0; frostLossShare(u) <- 0.40;
+                simAirTemp(u) <- 26.0; simAirHum(u) <- 80.0; simSoilMoist(u) <- 58.0; simSoilTemp(u) <- 24.0; simLeafWet(u) <- 40.0;
+                soilN(u) <- 32.0; soilP(u) <- 39.0; soilK(u) <- 235.0; nMin(u) <- 30.0; baseTemp(u) <- 10.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 950.0; sowDate(u) <- 2026_03_22; }
+            NEW u = EquipmentUnit { euName(u) <- 'Грядки капусты'; euScope(u) <- 'agro'; euType(u) <- typeByName('Грядка'); euGroup(u) <- 'Дон'; euIndex(u) <- 218; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Капуста'; areaHa(u) <- 6.0; cropValueHa(u) <- 320000.0; frostThreshold(u) <- 0.0; soilMoistMin(u) <- 42.0; irrigationCostHa(u) <- 6500.0; frostLossShare(u) <- 0.35;
+                simAirTemp(u) <- 22.0; simAirHum(u) <- 70.0; simSoilMoist(u) <- 36.0; simSoilTemp(u) <- 19.0; simLeafWet(u) <- 47.0;
+                soilN(u) <- 24.0; soilP(u) <- 31.0; soilK(u) <- 220.0; nMin(u) <- 30.0; baseTemp(u) <- 7.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 700.0; sowDate(u) <- 2026_04_06; }
+        }
+        APPLY;
+    }
+    // +2 поля (четвёртый заход) — добить последний ряд сцены
+    IF NOT (GROUP MAX EquipmentUnit u IF euName(u) = 'Поле сахарной свёклы') THEN {
+        FOR name(Location s) = 'Агроплощадка «Кубань»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле сахарной свёклы'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Кубань'; euIndex(u) <- 219; euSource(u) <- 'sim'; euGeoLat(u) <- 45.040000; euGeoLon(u) <- 38.976000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Сахарная свёкла'; areaHa(u) <- 55.0; cropValueHa(u) <- 135000.0; frostThreshold(u) <- 0.0; soilMoistMin(u) <- 35.0; irrigationCostHa(u) <- 2100.0; frostLossShare(u) <- 0.30;
+                simAirTemp(u) <- 25.0; simAirHum(u) <- 62.0; simSoilMoist(u) <- 38.0; simSoilTemp(u) <- 21.0; simLeafWet(u) <- 30.0;
+                soilN(u) <- 29.0; soilP(u) <- 34.0; soilK(u) <- 215.0; nMin(u) <- 30.0; baseTemp(u) <- 6.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 900.0; sowDate(u) <- 2026_04_10; }
+        }
+        FOR name(Location s) = 'Агроплощадка «Дон»' DO {
+            NEW u = EquipmentUnit { euName(u) <- 'Поле люцерны'; euScope(u) <- 'agro'; euType(u) <- typeByName('Поле'); euGroup(u) <- 'Дон'; euIndex(u) <- 220; euSource(u) <- 'sim'; euGeoLat(u) <- 47.235000; euGeoLon(u) <- 39.701000;
+                isAgro(u) <- TRUE; agroSite(u) <- s; crop(u) <- 'Люцерна'; areaHa(u) <- 48.0; cropValueHa(u) <- 80000.0; frostThreshold(u) <- -2.0; soilMoistMin(u) <- 32.0; irrigationCostHa(u) <- 1500.0; frostLossShare(u) <- 0.20;
+                simAirTemp(u) <- 23.0; simAirHum(u) <- 58.0; simSoilMoist(u) <- 34.0; simSoilTemp(u) <- 20.0; simLeafWet(u) <- 24.0;
+                soilN(u) <- 31.0; soilP(u) <- 36.0; soilK(u) <- 225.0; nMin(u) <- 30.0; baseTemp(u) <- 5.0; gddHarvest(u) <- 1500.0; gddSum(u) <- 800.0; sowDate(u) <- 2026_03_25; }
+        }
+        APPLY;
+    }
+    // склад удобрений/СЗР (остатки) — часть НИЖЕ минимума, чтобы витрина показывала заявки
+    IF NOT (GROUP MAX Spare s IF isFertSpare(s)) THEN {
+        NEW s = Spare { spareName(s) <- 'Карбамид (N 46%)'; spareQty(s) <- 1200; spareMin(s) <- 500; sparePrice(s) <- 45; isFertSpare(s) <- TRUE; }
+        NEW s = Spare { spareName(s) <- 'NPK-комплекс'; spareQty(s) <- 320; spareMin(s) <- 500; sparePrice(s) <- 62; isFertSpare(s) <- TRUE; }
+        NEW s = Spare { spareName(s) <- 'Сульфат калия'; spareQty(s) <- 800; spareMin(s) <- 400; sparePrice(s) <- 70; isFertSpare(s) <- TRUE; }
+        NEW s = Spare { spareName(s) <- 'Сера коллоидная (фунгицид)'; spareQty(s) <- 90; spareMin(s) <- 150; sparePrice(s) <- 120; isFertSpare(s) <- TRUE; }
+        NEW s = Spare { spareName(s) <- 'Медный купорос (фунгицид)'; spareQty(s) <- 240; spareMin(s) <- 150; sparePrice(s) <- 95; isFertSpare(s) <- TRUE; }
+        APPLY;
+    }
+    // партии удобрений/СЗР (приход/остаток/срок) — часть с близким сроком годности → аналитика
+    IF NOT (GROUP MAX FertBatch b) THEN {
+        FOR spareName(Spare s) = 'Карбамид (N 46%)' DO {
+            NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'КАРБ-24/05'; fbDate(b) <- 2026_05_10; fbQtyIn(b) <- 800.0; fbRemain(b) <- 620.0; fbPrice(b) <- 45.0; fbExpiry(b) <- 2027_05_10; fbSupplier(b) <- 'ФосАгро'; }
+            NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'КАРБ-24/01'; fbDate(b) <- 2026_01_15; fbQtyIn(b) <- 600.0; fbRemain(b) <- 480.0; fbPrice(b) <- 43.0; fbExpiry(b) <- 2026_09_15; fbSupplier(b) <- 'ФосАгро'; }
+        }
+        FOR spareName(Spare s) = 'NPK-комплекс' DO {
+            NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'NPK-24/04'; fbDate(b) <- 2026_04_20; fbQtyIn(b) <- 500.0; fbRemain(b) <- 180.0; fbPrice(b) <- 62.0; fbExpiry(b) <- 2026_08_30; fbSupplier(b) <- 'Уралхим'; }
+        }
+        FOR spareName(Spare s) = 'Сульфат калия' DO {
+            NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'СК-24/06'; fbDate(b) <- 2026_06_01; fbQtyIn(b) <- 900.0; fbRemain(b) <- 800.0; fbPrice(b) <- 70.0; fbExpiry(b) <- 2027_06_01; fbSupplier(b) <- 'Уралхим'; }
+        }
+        FOR spareName(Spare s) = 'Сера коллоидная (фунгицид)' DO {
+            NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'СЕРА-24/02'; fbDate(b) <- 2026_02_10; fbQtyIn(b) <- 150.0; fbRemain(b) <- 60.0; fbPrice(b) <- 120.0; fbExpiry(b) <- 2026_08_10; fbSupplier(b) <- 'Август'; }
+        }
+        FOR spareName(Spare s) = 'Медный купорос (фунгицид)' DO {
+            NEW b = FertBatch { fbSpare(b) <- s; fbNumber(b) <- 'МЕД-24/03'; fbDate(b) <- 2026_03_05; fbQtyIn(b) <- 300.0; fbRemain(b) <- 240.0; fbPrice(b) <- 95.0; fbExpiry(b) <- 2027_02_01; fbSupplier(b) <- 'Август'; }
+        }
+        APPLY;
+    }
+    // журнал удобрений (чтобы не был пустым) — несколько внесений
+    IF NOT (GROUP MAX Fertilization f) THEN {
+        FOR euName(EquipmentUnit u) = 'Поле озимой пшеницы' DO NEW f = Fertilization { fUnit(f) <- u; fDate(f) <- 2026_06_18; fProduct(f) <- 'Карбамид (N 46%)'; fDoseKgHa(f) <- 120.0; fCost(f) <- 480000.0; }
+        FOR euName(EquipmentUnit u) = 'Поле кукурузы' DO NEW f = Fertilization { fUnit(f) <- u; fDate(f) <- 2026_06_22; fProduct(f) <- 'NPK-комплекс'; fDoseKgHa(f) <- 150.0; fCost(f) <- 540000.0; }
+        FOR euName(EquipmentUnit u) = 'Теплица томаты' DO NEW f = Fertilization { fUnit(f) <- u; fDate(f) <- 2026_06_28; fProduct(f) <- 'NPK-комплекс'; fDoseKgHa(f) <- 200.0; fCost(f) <- 12000.0; }
+        FOR euName(EquipmentUnit u) = 'Сад яблоневый' DO NEW f = Fertilization { fUnit(f) <- u; fDate(f) <- 2026_07_01; fProduct(f) <- 'Сульфат калия'; fDoseKgHa(f) <- 90.0; fCost(f) <- 252000.0; }
+        FOR euName(EquipmentUnit u) = 'Грядки овощные' DO NEW f = Fertilization { fUnit(f) <- u; fDate(f) <- 2026_07_02; fProduct(f) <- 'NPK-комплекс'; fDoseKgHa(f) <- 180.0; fCost(f) <- 20250.0; }
+        APPLY;
+    }
+    // заявки поставщику (ERP) по удобрениям — витрина связи
+    IF NOT (GROUP MAX PurchaseReq r IF isFertReq(r)) THEN {
+        FOR spareName(Spare s) = 'NPK-комплекс' DO { prSeq() <- (OVERRIDE prSeq(), 5000) + 1; NEW r = PurchaseReq { prNumber(r) <- prSeq(); prDate(r) <- currentDateTime(); prSpare(r) <- s; prQty(r) <- 750; prStatus(r) <- 'создана'; } }
+        FOR spareName(Spare s) = 'Сера коллоидная (фунгицид)' DO { prSeq() <- (OVERRIDE prSeq(), 5000) + 1; NEW r = PurchaseReq { prNumber(r) <- prSeq(); prDate(r) <- currentDateTime(); prSpare(r) <- s; prQty(r) <- 225; prStatus(r) <- 'подтверждена'; } }
+        APPLY;
+    }
+    // v2: разнообразим N/P/K по культурам → fertProd даёт разные удобрения (не только карбамид)
+    IF (OVERRIDE seedVer(), 0) < 2 THEN {
+        FOR euName(EquipmentUnit u) = 'Поле озимой пшеницы' DO { soilN(u) <- 22.0; soilP(u) <- 34.0; soilK(u) <- 220.0; }   // низкий N → Карбамид
+        FOR euName(EquipmentUnit u) = 'Поле кукурузы' DO { soilN(u) <- 34.0; soilP(u) <- 30.0; soilK(u) <- 155.0; }           // низкий K → Сульфат калия
+        FOR euName(EquipmentUnit u) = 'Поле подсолнечника' DO { soilN(u) <- 33.0; soilP(u) <- 20.0; soilK(u) <- 210.0; }      // низкий P → Суперфосфат
+        FOR euName(EquipmentUnit u) = 'Поле сои' DO { soilN(u) <- 35.0; soilP(u) <- 21.0; soilK(u) <- 205.0; }                // низкий P → Суперфосфат
+        FOR euName(EquipmentUnit u) = 'Поле рапса' DO { soilN(u) <- 32.0; soilP(u) <- 31.0; soilK(u) <- 150.0; }              // низкий K → Сульфат калия
+        FOR euName(EquipmentUnit u) = 'Грядки овощные' DO { soilN(u) <- 26.0; soilP(u) <- 22.0; soilK(u) <- 215.0; }          // N+P → NPK
+        FOR euName(EquipmentUnit u) = 'Грядки клубники' DO { soilN(u) <- 24.0; soilP(u) <- 31.0; soilK(u) <- 165.0; }         // N+K → NPK
+        FOR euName(EquipmentUnit u) = 'Теплица томаты' DO { soilN(u) <- 25.0; soilP(u) <- 36.0; soilK(u) <- 235.0; }          // низкий N → Карбамид
+        FOR euName(EquipmentUnit u) = 'Теплица огурцы' DO { soilN(u) <- 35.0; soilP(u) <- 41.0; soilK(u) <- 245.0; }          // норма → поддержка NPK
+        FOR euName(EquipmentUnit u) = 'Сад яблоневый' DO { soilN(u) <- 27.0; soilP(u) <- 30.0; soilK(u) <- 168.0; }           // N+K → NPK
+        FOR euName(EquipmentUnit u) = 'Виноградник' DO { soilN(u) <- 26.0; soilP(u) <- 33.0; soilK(u) <- 215.0; }             // низкий N → Карбамид
+        seedVer() <- 2;
+        APPLY;
+    }
+}
+
+onStarted() + {
+    // ДЕМО-ДАННЫЕ (делянки, склад удобрений, партии, заявки) — ТОЛЬКО на стенде.
+    // На боевой базе агро-объекты заводит заказчик, пересевать их нельзя.
+    IF Mite.standMode() THEN agroSeed();
+    // пересборка сцены нужна всегда: считает тип/позицию/фазу/покров по РЕАЛЬНЫМ данным.
+    refreshAgroScene();
+}

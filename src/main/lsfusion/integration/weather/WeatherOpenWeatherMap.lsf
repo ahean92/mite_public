@@ -1,0 +1,62 @@
+MODULE WeatherOpenWeatherMap;
+
+// Провайдер погоды: OpenWeatherMap (бесплатный эндпоинт 5 дней / 3 часа).
+// Реализует ABSTRACT Weather.updateWeather(Location) через EXTERNAL HTTP + IMPORT JSON.
+REQUIRE Weather, Options;
+
+NAMESPACE Weather;
+
+// Ключ API (вставляет пользователь в настройках; единый на приложение)
+owmApiKey 'Ключ OpenWeatherMap' = DATA STRING[40] ();
+
+// ===== Разбор JSON ответа OWM: { "list": [ { dt_txt, pop, main:{temp,feels_like,humidity}, wind:{speed}, clouds:{all} } ] } =====
+GROUP owmMainG EXTID 'main';     // вложенный объект элемента .main
+GROUP owmWindG EXTID 'wind';     // .wind
+GROUP owmCloudsG EXTID 'clouds'; // .clouds
+
+owmDt = DATA LOCAL DATETIME (INTEGER);
+owmTemp = DATA LOCAL DOUBLE (INTEGER);
+owmFeels = DATA LOCAL DOUBLE (INTEGER);
+owmHum = DATA LOCAL INTEGER (INTEGER);
+owmWindSpeed = DATA LOCAL DOUBLE (INTEGER);
+owmCloud = DATA LOCAL INTEGER (INTEGER);
+owmPop = DATA LOCAL DOUBLE (INTEGER);
+
+FORM owmImport
+    OBJECTS list = INTEGER
+    PROPERTIES (list) owmDt EXTID 'dt_txt', owmPop EXTID 'pop'
+    PROPERTIES (list) IN owmMainG owmTemp EXTID 'temp', owmFeels EXTID 'feels_like', owmHum EXTID 'humidity'
+    PROPERTIES (list) IN owmWindG owmWindSpeed EXTID 'speed'
+    PROPERTIES (list) IN owmCloudsG owmCloud EXTID 'all'
+;
+
+// ===== Загрузка прогноза для точки =====
+updateWeatherOWM (Location l) {
+    IF owmApiKey() AND latitude(l) AND longitude(l) THEN {
+        LOCAL response = JSONFILE ();
+        EXTERNAL HTTP GET 'https://api.openweathermap.org/data/2.5/forecast?lat=' + latitude(l) + '&lon=' + longitude(l) + '&units=metric&lang=ru&appid=' + owmApiKey() TO response;
+        IF failedHttp() THEN {
+            MESSAGE 'OWM: ошибка запроса ' + statusHttp() NOWAIT;
+        } ELSE {
+            IMPORT owmImport JSON FROM response();
+            // перезаписываем прогноз точки целиком
+            FOR location(WeatherForecast wf) = l DO DELETE wf;
+            FOR owmDt(INTEGER slot) DO
+                NEW f = WeatherForecast {
+                    location(f) <- l;
+                    time(f) <- ZDATETIME(owmDt(slot));
+                    fetched(f) <- currentZDateTime();
+                    temperature(f) <- owmTemp(slot);
+                    feelsLike(f) <- owmFeels(slot);
+                    humidity(f) <- owmHum(slot);
+                    precipitation(f) <- round0(owmPop(slot) * 100);
+                    windSpeed(f) <- owmWindSpeed(slot);
+                    cloudCover(f) <- owmCloud(slot);
+                }
+            APPLY;
+        }
+    }
+}
+updateWeather(Location l) + {
+    updateWeatherOWM(l);
+}
