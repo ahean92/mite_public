@@ -1,0 +1,8 @@
+MODULE OrgManagementReport;
+
+REQUIRE OrgUser, ManagementReport, OrgManagement;
+
+organization(ManagerLog ml) = organization(manager(ml));
+belongsCurrentOrganization(Device d, ManagerCondition c) += organization(d) = organization(controller(c));
+
+@addOrganization(managerLogs, ml);

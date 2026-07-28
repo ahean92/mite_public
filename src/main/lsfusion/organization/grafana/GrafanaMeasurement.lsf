@@ -1,0 +1,24 @@
+MODULE GrafanaMeasurement;
+
+REQUIRE Measurement;
+
+NAMESPACE Measurement;
+
+///// Таблица, из которой Grafana берет данные
+TABLE values (Measurement, MeasurementType);
+id (Measurement m, MeasurementType mt) = id(device(m)) IF value(m, mt) MATERIALIZED ;
+id_MeasurementType (Measurement m, MeasurementType mt) = id(mt) IF value(m, mt) MATERIALIZED INDEXED;
+INDEX id(Measurement m, MeasurementType mt), id_MeasurementType(m, mt), dateTime(m, mt);
+/////
+
+index 'Индекс Panel' = DATA INTEGER (DeviceType, MeasurementType) CHARWIDTH 7;
+filePanel 'Файл шаблона Panel' = DATA FILE (MeasurementType) CHARWIDTH 7;
+
+EXTEND FORM deviceTypes 
+    PROPERTIES (mt) filePanel
+;
+
+EXTEND FORM deviceTypes
+    PROPERTIES index(t, mt)
+;
+

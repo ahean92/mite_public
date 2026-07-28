@@ -1,0 +1,195 @@
+MODULE Measurement;
+
+REQUIRE Device, Utils, Time, Security, Options;
+
+///// TYPES /////
+
+CLASS MeasurementType 'Тип измерения';
+TABLE measurementType (MeasurementType);
+
+id 'ID панели' = DATA LONG (MeasurementType);
+name 'Название' = DATA STRING[100] (MeasurementType) CHARWIDTH 10 IN id;
+
+FORM measurementTypes
+    OBJECTS m = MeasurementType
+    PROPERTIES (m) READONLY name
+;
+
+number 'Номер в CSV-файле' = DATA INTEGER (DeviceType, MeasurementType);
+
+// уникальность и обязательность заполнения
+measurementType = GROUP AGGR MeasurementType mt BY id(mt);
+CONSTRAINT MeasurementType mt IS MeasurementType AND NOT id(mt) MESSAGE 'Не заполнен ID панели для типа измерения !';
+
+CLASS DisplayMeasurement 'Текст измерения';
+type = DATA MeasurementType (DisplayMeasurement);
+caption 'Текст' = DATA STRING (DisplayMeasurement);
+value 'Значение' = DATA INTEGER (DisplayMeasurement);
+
+displayValues 'Тексты измерений' = GROUP CONCAT value(DisplayMeasurement dm) + ' - ' + caption(dm), ',' ORDER dm BY type(dm); 
+displayMeasurement = GROUP AGGR DisplayMeasurement m BY type(m), value(m) MATERIALIZED;
+hasDisplay = GROUP SUM 1 BY type(DisplayMeasurement dm); 
+
+displayInt 'Значение' (MeasurementType mt, INTEGER i) = caption(displayMeasurement(mt, i));
+display (MeasurementType mt, DOUBLE d) = OVERRIDE displayInt(mt, round(d, 0)), STRING(NUMERIC[30,2](d)) IF mt IS MeasurementType, '0.00' IF mt IS MeasurementType;
+
+FORM displayMeasurements 'Тексты измерений'
+    OBJECTS mt = MeasurementType PANEL
+    OBJECTS dm = DisplayMeasurement
+    
+    PROPERTIES (dm) value, caption, NEW, DELETE
+    FILTERS type(dm) = mt
+;
+
+EXTEND FORM deviceTypes
+    OBJECTS mt = MeasurementType
+    PROPERTIES (mt) id, name
+    PROPERTIES(t, mt) number
+    PROPERTIES displayValues(mt) ON CHANGE { SHOW displayMeasurements OBJECTS mt=mt WAIT NEWSESSION; }
+    PROPERTIES (mt) NEW, DELETE
+;
+
+DESIGN deviceTypes {
+    tab {
+        MOVE BOX(mt) {
+            caption = 'Типы измерений';
+        }
+    }
+}
+
+///// INSTANCES /////
+
+CLASS Measurement 'Измерение';
+device = DATA Device (Measurement);
+deviceId 'ИД устройства' (Measurement m) = id(device(m)) MATERIALIZED;
+nameDeviceType 'Тип устройства' (Measurement m) = name(type(device(m)));
+dateTime 'Время измерения' = DATA ZDATETIME (Measurement);
+idImport 'ИД импортируемое' = DATA LONG (Measurement);
+
+value 'Значение (raw)' = DATA DOUBLE (Measurement, MeasurementType);
+
+// denormalized data for quick access
+dateTime 'Время' (Measurement m, MeasurementType mt) = dateTime(m) IF value(m, mt) MATERIALIZED ; // needed also for grafana
+device (Measurement m, MeasurementType mt) = device(m) IF value(m, mt) MATERIALIZED;
+INDEX device(Measurement m, MeasurementType mt), dateTime(m, mt);
+INDEX device(Measurement m, MeasurementType mt), mt, dateTime(m, mt);
+
+INDEX dateTime(Measurement m), m;
+INDEX device(Measurement m), dateTime(m), m;
+lastMeasurement = GROUP LAST Measurement m ORDER dateTime(m), m BY device(m) MATERIALIZED;
+measurement(Device d, ZDATETIME dt) = GROUP LAST Measurement m IF dateTime(m) <= dt ORDER dateTime(m), m BY device(m);
+lastValue 'Тек. значение (raw)' (Device d, MeasurementType m) = value(lastMeasurement(d), m) MATERIALIZED;
+value 'Значение (raw)' (Device d, MeasurementType m, ZDATETIME dt) = value(measurement(d, dt), m);
+
+prevLastValue (Device d, MeasurementType m) = PREV(lastValue(d, m));
+
+// подсчет среднего
+// дольше стартует но быстрее на добавление работает, с изменениями все равно смотрит для всех записей
+//prevMeasurement (Device d, ZDATETIME dt, Measurement m) = GROUP LAST Measurement mt IF device(mt) = d AND (dateTime(mt) < dt OR (dateTime(mt) = dt AND mt < m)) ORDER dateTime(mt), mt;
+//prevMeasurement (Measurement m) = prevMeasurement(device(m), dateTime(m), m) MATERIALIZED;
+// быстро стартует, но обновляется плохо
+//prevMeasurement (Measurement m) = PARTITION PREV m ORDER dateTime(m), m BY device(m) MATERIALIZED;
+//changeValue(Measurement m, MeasurementType mt) = value(m, mt) (-) value(prevMeasurement(m), mt) MATERIALIZED;
+//value(Device d, MeasurementType mt, ZDATETIME dateFrom, ZDATETIME dateTo) = value(d, mt, dateFrom) (+) 
+//                                                                    ((GROUP SUM changeValue(Measurement m, mt) * subtractSeconds(dateTime(m), dateTo) IF device(m) = d AND dateTime(m) > dateFrom AND dateTime(m) <= dateTo) / subtractSeconds(dateFrom, dateTo));
+// не точно при непостоянных измерениях, но зато быстро
+value(Device d, MeasurementType mt, ZDATETIME dateFrom, ZDATETIME dateTo) = ((value(d, mt, dateFrom) (+) (GROUP SUM value(Measurement m, mt) IF device(m, mt) = d AND dateTime(m, mt) > dateFrom AND dateTime(m, mt) <= dateTo)) / (1 (+) (GROUP SUM 1 IF device(Measurement m) = d AND dateTime(m) > dateFrom AND dateTime(m) <= dateTo)));
+  
+background = ABSTRACT COLOR (Device, MeasurementType);
+
+displayValue 'Значение' (Measurement m, MeasurementType mt) = display(mt, value(m, mt));
+lastDisplayValue 'Тек. значение' (Device d, MeasurementType m) = display(m, lastValue(d, m));
+
+disableImport 'Отключить прием' (Device d) = DATA BOOLEAN;
+
+EXTEND FORM devices 
+    PROPERTIES (d) disableImport
+    
+    OBJECTS cmt = MeasurementType
+    FILTERS number(type(d),cmt)
+    
+    OBJECTS m = Measurement FIRST
+    PROPERTIES(m) READONLY dateTime  
+    PROPERTIES COLUMNS (cmt) displayValue(m, cmt) HEADER name(cmt), value(m, cmt) HEADER name(cmt) + ' (raw)' SHOWIF hasDisplay(cmt) // READONLY
+    PROPERTIES(m) id = VALUE SHOWIF NULL
+    FILTERS device(m)=d
+    ORDERS dateTime(m) DESC, id DESC
+    
+    PROPERTIES BACKGROUND background(d, cmt) DRAW d COLUMNS (cmt) PANEL lastDisplayValue(d, cmt) HEADER name(cmt) // , lastValue(d, cmt) HEADER name(cmt) + ' (raw)' SHOWIF hasDisplay(cmt)
+;
+
+DESIGN devices {
+    tab {
+        MOVE BOX (m) {
+            caption = 'Измерения';
+        }
+    }
+    GRID (d) {
+        NEW dPanel {
+//            MOVE PROPERTY(lastValue(d, cmt));
+            MOVE PROPERTY(lastDisplayValue(d, cmt)) {
+                panelColumnVertical = TRUE;
+            }
+        }
+    }
+}
+
+CLASS MeasurementAdjustment 'Корректировка';
+device = DATA Device (MeasurementAdjustment);
+type = DATA MeasurementType (MeasurementAdjustment);
+value 'Значение' = DATA DOUBLE (MeasurementAdjustment);
+delta 'Дельта (+)' = DATA DOUBLE (MeasurementAdjustment);
+showAdjustment (Device d, MeasurementType mt) = ABSTRACT VALUE INTEGER;
+countAdjustments = GROUP SUM 1 BY device(MeasurementAdjustment a), type(a) MATERIALIZED;
+showAdjustment (Device d, MeasurementType mt) += countAdjustments(d, mt);
+adjustDown(Device d, MeasurementType type, DOUBLE value) = GROUP LAST MeasurementAdjustment a ORDER value(a), a 
+                                                                                    WHERE value(a) <= value BY device(a), type(a);
+adjustUp(Device d, MeasurementType type, DOUBLE value) = GROUP LAST MeasurementAdjustment a ORDER DESC value(a) , a 
+                                                                                    WHERE value(a) > value BY device(a), type(a);
+valueAdjustDown(Device d, MeasurementType t, DOUBLE value) = value(adjustDown(d, t, value));
+valueAdjustUp(Device d, MeasurementType t, DOUBLE value) = value(adjustUp(d, t, value));
+valueAdjustDelta(Device d, MeasurementType t, DOUBLE value) = valueAdjustUp(d, t, value) - valueAdjustDown(d, t, value);
+adjustDelta(Device d, MeasurementType t, DOUBLE value) = delta(adjustUp(d, t, value)) * (value - valueAdjustDown(d, t, value)) / valueAdjustDelta(d, t, value) +
+                                                                          delta(adjustDown(d, t, value)) * (valueAdjustUp(d, t, value) - value) / valueAdjustDelta(d, t, value);
+unAdjustedValue = DATA DOUBLE (Measurement, MeasurementType);
+finalAdjustValue = ABSTRACT VALUE DOUBLE (Measurement, MeasurementType, DOUBLE);
+finalAdjustValue(Measurement m, MeasurementType mt, DOUBLE v) += v AS DOUBLE; 
+WHEN CHANGED (unAdjustedValue(Measurement m, MeasurementType mt)) DO 
+    value(m, mt) <- finalAdjustValue(m, mt, unAdjustedValue(m, mt) (+) adjustDelta(device(m), mt, unAdjustedValue(m, mt)));
+
+GROUP testAdjustment 'Тест корректировки';
+testUnAdjustedValue 'До' = DATA DOUBLE () IN testAdjustment;
+adjustValue(Device d, MeasurementType mt, DOUBLE v) = v (+) adjustDelta(d, mt, v);
+testAdjustedValue 'После' (Device d, MeasurementType mt)  = adjustValue(d, mt, testUnAdjustedValue()) IN testAdjustment;
+
+EXTEND FORM devices
+    OBJECTS amt = MeasurementType PANEL
+    PROPERTIES (amt) name SELECTOR
+    PROPERTIES DRAW amt testUnAdjustedValue(), testAdjustedValue(d, amt) 
+    FILTERS number(type(d), amt)
+
+    OBJECTS ma = MeasurementAdjustment
+    PROPERTIES (ma) value, delta, NEW, DELETE
+    FILTERS type(ma) = amt, device(ma) = d
+
+    PROPERTIES COLUMNS (cmt) unAdjustedValue(m, cmt) HEADER 'Имп. : ' + name(cmt) SHOWIF showAdjustment(d, cmt)
+;
+
+DESIGN devices {
+    tab {
+        NEW limit {
+            horizontal = FALSE;
+            caption = 'Калибровка';
+            NEW panel {
+                horizontal = TRUE;
+                MOVE BOX (amt);
+                MOVE GROUP (testAdjustment,amt);
+            }
+            MOVE BOX (ma) {
+                fill = 1;
+            }
+            
+            fill = 1;
+        }
+    }
+}

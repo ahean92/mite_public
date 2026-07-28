@@ -1,0 +1,825 @@
+MODULE Mite;
+
+REQUIRE Options, Country, Organization, 
+        OrgDevice, OrgMeasurement, 
+        OrgController, OrgControllerDevice,
+        OrgManagement, OrgManagementReport,
+        ProcessMonitor, SQLUtils, Backup, Eval,
+        GrafanaDashboard,
+        MqttServer, Server,
+        Export, 
+        Telegram, Viber, Skype, Slack, Icon, Modbus;
+
+// ===== Роль «Logist»: упрощённый вид — размещение/датчики/значения/отчёты/дашборды;
+// скрыты корректировки и расписания (через SHOWIF по флагу роли; «неподозрительно») =====
+isLogist 'Логист' = DATA BOOLEAN (UserRole);
+isLogist (CustomUser user) = GROUP MAX isLogist(UserRole ur) IF in(user, ur);
+isLogistUser () = isLogist(currentUser());
+notLogistUser () = NOT isLogistUser();
+copy(UserRole to, UserRole fr) + { isLogist(to) <- isLogist(fr); }
+EXTEND FORM securityPolicy PROPERTIES (ur) isLogist;
+onStarted() + {
+    IF NOT userRoleSID('logist') THEN
+        NEW r = UserRole {
+            sid(r) <- 'logist';
+            name(r) <- 'Logist';
+            isOrg(r) <- TRUE;
+            isLogist(r) <- TRUE;
+            fillDefaultAccess(r);
+        }
+}
+
+simID 'Sim ID' = DATA STRING (Device);
+EXTEND FORM deviceTypes
+    PROPERTIES (d) simID
+;
+writeSimID(LONG l, STRING simID) + {
+    APPLY FOR Device d = device(l) DO
+        simID(d) <- simID;
+}
+deviceBySimID = GROUP AGGR Device d BY simID(d);
+
+simID 'Sim ID' = DATA STRING (Controller);
+EXTEND FORM controllerTypes
+    PROPERTIES (c) simID
+;
+
+temperatureType = GROUP AGGR MeasurementType type WHERE name(type) = r'Температура';
+humidityType = GROUP AGGR MeasurementType type WHERE name(type) = r'Влажность';
+batteryType = GROUP AGGR MeasurementType type WHERE name(type) = r'Батарея';
+
+isDayOff(DATE d) += isDayOff(defaultCountry(), d);
+fixed(MeasurementType mt) += mt = batteryType();
+
+maxFixedValue 'Макс. фикс. значение' (Device d, MeasurementType mt) = GROUP MAX OVERRIDE value(right(ValuesCondition cv)) IF device(left(cv)) = d AND measurementType(left(cv)) = mt AND belongsCurrentOrganization(d, cv),
+    value(left(cv)) IF device(right(cv)) = d AND measurementType(right(cv)) = mt AND belongsCurrentOrganization(d, cv);
+minFixedValue 'Мин. фикс. значение' (Device d, MeasurementType mt) = GROUP MIN OVERRIDE value(right(ValuesCondition cv)) IF device(left(cv)) = d AND measurementType(left(cv)) = mt AND belongsCurrentOrganization(d, cv),
+    value(left(cv)) IF device(right(cv)) = d AND measurementType(right(cv)) = mt AND belongsCurrentOrganization(d, cv);
+                                                                   
+GROUP settings 'Настройки' : public;                                                   
+measurementPeriod 'Период измерений' = DATA NUMERIC (Device) IN settings;
+transmissionPeriod 'Период передачи' = DATA NUMERIC (Device) IN settings;
+maxTemperature 'Макс. температура' (Device d) = maxFixedValue(d, temperatureType()) IN settings;
+maxHumidity 'Макс. влажность' (Device d) = maxFixedValue(d, humidityType()) IN settings;
+minTemperature 'Мин. температура' (Device d) = minFixedValue(d, temperatureType()) IN settings;
+minHumidity 'Мин. влажность' (Device d) = minFixedValue(d, humidityType()) IN settings;
+adjustmentTemperature 'Температура корр.' (Device d) = importAdjustmentValue(d AS Device, temperatureType()) IN settings;
+adjustmentHumidity 'Влажность корр.' (Device d) = importAdjustmentValue(d AS Device, humidityType()) IN settings;
+
+updateDeviceSettings 'Обновить' INTERNAL 'mite.UpdateDeviceSettingsAction' (Device) IN settings; 
+WHEN CHANGED (measurementPeriod(Device d)) OR CHANGED (transmissionPeriod(d)) OR 
+        CHANGED (maxTemperature(d)) OR CHANGED (maxHumidity(d)) OR
+        CHANGED (adjustmentTemperature(d)) OR CHANGED (adjustmentHumidity(d)) OR
+        CHANGED (minTemperature(d)) OR CHANGED (minHumidity(d)) DO
+    updateDeviceSettings(d);
+    
+EXTEND FORM devices
+    PROPERTIES (d) PANEL measurementPeriod, transmissionPeriod, minTemperature, maxTemperature, minHumidity, maxHumidity, adjustmentTemperature, adjustmentHumidity, updateDeviceSettings
+;
+
+DESIGN devices {
+    settings {
+        MOVE GROUP (settings, d) { horizontal = FALSE; };
+    }
+}
+
+machine 'Машина' = DATA BOOLEAN (Location);
+machineLocation 'Машина' (Location l) = GROUP LAST Location ml IF machine(ml) ORDER DESC level(l, ml) MATERIALIZED;
+machineLocation 'Машина' (Device d) = machineLocation(location(d)) MATERIALIZED INDEXED;
+nameMachine 'Машина' (Device d) = name(machineLocation(d));
+
+EXTEND FORM locations
+    PROPERTIES (l) machine
+;
+
+EXTEND FORM devices
+    PROPERTIES (d) nameMachine
+;
+
+///// РАСПИСАНИЕ КОРРЕКТИРОВКИ /////
+
+// Единый класс расписания
+CLASS AdjustSchedule 'Расписание корр.';
+organization 'Организация' = DATA Organization (AdjustSchedule);
+name 'Название' = DATA STRING[100] (AdjustSchedule) NONULL IN id;
+timeFrom 'Начало' = DATA TIME (AdjustSchedule) NONULL;
+timeTo 'Окончание' = DATA TIME (AdjustSchedule) NONULL;
+// «нулевое окно»: Начало = Окончание ⇒ день НЕ контролируется (расписание-заглушка «Не контролировать»)
+notControlSchedule (AdjustSchedule s) = timeFrom(s) = timeTo(s);
+
+// Базовые расписания задаются для точки размещения отдельно по каждому дню недели
+adjustSchedule = DATA AdjustSchedule (Location, DOW);
+nameAdjustSchedule 'Расписание' (Location l, DOW dow) = name(adjustSchedule(l, dow));
+
+dataScheduleFor = DATA AdjustSchedule (Location, DATE);
+
+CONSTRAINT organization(dataScheduleFor(Location l, DATE d)) != organization(l) CHECKED BY dataScheduleFor MESSAGE 'Организация расписания должна совпадать с организацией точки размещения'; 
+CONSTRAINT organization(adjustSchedule(Location l, DOW dow)) != organization(l) CHECKED BY adjustSchedule[Location, DOW] MESSAGE 'Организация расписания должна совпадать с организацией точки размещения'; 
+    
+// Выбор расписания на дату для точки размещения
+scheduleFor(Location l, DATE d) = 
+    OVERRIDE dataScheduleFor(l, d),
+        adjustSchedule(l, extractDOW(d));
+nameScheduleFor 'Расписание' (Location l, DATE d) = name(scheduleFor(l, d));
+dataTimeFrom = DATA TIME (Location, DATE);
+dataTimeTo = DATA TIME (Location, DATE);
+timeFrom 'Начало' (Location l, DATE d) = OVERRIDE dataTimeFrom(l, d), (timeFrom(scheduleFor(l, d)) IF NOT notControlSchedule(scheduleFor(l, d)));
+timeTo 'Окончание' (Location l, DATE d) = OVERRIDE dataTimeTo(l, d), (timeTo(scheduleFor(l, d)) IF NOT notControlSchedule(scheduleFor(l, d)));
+
+// ===== Расписание ДЛЯ ОТЧЁТА (реальная поездка) — ПРЯМОЕ время выезда/приезда по дню недели.
+// Задаётся раз по дню недели, применяется ко всем будущим датам (без дублирования). Бот и маршрутный отчёт берут отсюда. =====
+reportDeparture 'Выезд (отчёт)' = DATA TIME (Location, DOW);
+reportArrival 'Приезд (отчёт)' = DATA TIME (Location, DOW);
+// ручное время на конкретную дату — перебивает расписание по дню недели
+dataReportTimeFrom = DATA TIME (Location, DATE);
+dataReportTimeTo = DATA TIME (Location, DATE);
+// «Не контролировать» (нулевое окно расписания) исключаем из отчёта и бота — как и в timeFrom/timeTo выше.
+// Ручное время на дату (dataReportTime*) остаётся: это явное действие человека.
+reportTimeFrom 'Выезд (отчёт)' (Location l, DATE d) = OVERRIDE dataReportTimeFrom(l, d), (reportDeparture(l, extractDOW(d)) IF NOT notControlSchedule(scheduleFor(l, d)));
+reportTimeTo 'Приезд (отчёт)' (Location l, DATE d) = OVERRIDE dataReportTimeTo(l, d), (reportArrival(l, extractDOW(d)) IF NOT notControlSchedule(scheduleFor(l, d)));
+
+adjustValues 'Учавствует в корректировке' = DATA BOOLEAN (Management);
+inReport 'Участвует в отчете' = DATA BOOLEAN (Management);
+overChangedNames(Management cm) += CHANGED(adjustValues(cm));
+overChangedNames(Management cm) += CHANGED(inReport(cm));
+overCopyNames (Management cm, Management d) +{
+    adjustValues(cm) <- adjustValues(d);
+    inReport(cm) <- inReport(d);
+}
+EXTEND FORM controllerManager
+    PROPERTIES (c) adjustValues, inReport
+;
+
+maxAdjFixedValue 'Макс. фикс. значение' (Device d, MeasurementType mt) = GROUP MAX OVERRIDE value(right(ValuesCondition cv)) IF device(left(cv)) = d AND measurementType(left(cv)) = mt AND adjustValues(controller(cv)) AND belongsCurrentOrganization(d, cv),
+    value(left(cv)) IF device(right(cv)) = d AND measurementType(right(cv)) = mt AND adjustValues(controller(cv)) AND belongsCurrentOrganization(d, cv) MATERIALIZED;
+minAdjFixedValue 'Мин. фикс. значение' (Device d, MeasurementType mt) = GROUP MIN OVERRIDE value(right(ValuesCondition cv)) IF device(left(cv)) = d AND measurementType(left(cv)) = mt AND adjustValues(controller(cv)) AND belongsCurrentOrganization(d, cv),
+    value(left(cv)) IF device(right(cv)) = d AND measurementType(right(cv)) = mt AND adjustValues(controller(cv)) AND belongsCurrentOrganization(d, cv) MATERIALIZED;
+
+maxReportFixedValue 'Макс. фикс. значение (отчет)' (Device d, MeasurementType mt) = GROUP MAX OVERRIDE value(right(ValuesCondition cv)) IF device(left(cv)) = d AND measurementType(left(cv)) = mt AND inReport(controller(cv)) AND belongsCurrentOrganization(d, cv),
+    value(left(cv)) IF device(right(cv)) = d AND measurementType(right(cv)) = mt AND inReport(controller(cv)) AND belongsCurrentOrganization(d, cv) MATERIALIZED;
+minReportFixedValue 'Мин. фикс. значение (отчет)' (Device d, MeasurementType mt) = GROUP MIN OVERRIDE value(right(ValuesCondition cv)) IF device(left(cv)) = d AND measurementType(left(cv)) = mt AND inReport(controller(cv)) AND belongsCurrentOrganization(d, cv),
+    value(left(cv)) IF device(right(cv)) = d AND measurementType(right(cv)) = mt AND inReport(controller(cv)) AND belongsCurrentOrganization(d, cv) MATERIALIZED;
+
+noise 'Отклонение значения (0..1)' = DATA DOUBLE (Organization);
+periodMinutes 'Отклонение периода (мин.)' = DATA DOUBLE (Organization);
+noise(Device d, MeasurementType mt) = noise(organization(d)) IF mt IS MeasurementType;
+periodMinutes(Device d, MeasurementType mt) = periodMinutes(organization(d)) IF mt IS MeasurementType; // minutes
+adjustConfigured 'Корр. настроена' (Device d, MeasurementType mt) =
+    noise(d, mt) AND periodMinutes(d, mt) AND (maxAdjFixedValue(d, mt) OR minAdjFixedValue(d, mt));
+showAdjustment(Device d, MeasurementType mt) += 1 IF adjustConfigured(d, mt);
+
+noiseValue (Device d, MeasurementType mt) = (maxAdjFixedValue(d, mt) - minAdjFixedValue(d, mt)) * noise(d, mt) MATERIALIZED;
+
+///// РЕЖИМЫ ШУМА ПО ВРЕМЕНИ СУТОК /////
+// Режим шума — справочник: название + окно времени + ЦЕЛЬ (граница/середина) + ШУМ.
+// Вешается на датчик; в окне режима корректировка тянет к цели режима с его шумом.
+// Режим не выбран / вне окна -> обычное поведение: к границе, шум организации.
+CLASS CorrectionTarget {
+    toLimit 'К границе',
+    toMiddle 'К середине'
+}
+CLASS NoiseMode 'Режим шума';
+organization 'Организация' = DATA Organization (NoiseMode);
+name 'Название' = DATA STRING[100] (NoiseMode) NONULL IN id;
+timeFrom 'Начало' = DATA TIME (NoiseMode) NONULL;
+timeTo 'Окончание' = DATA TIME (NoiseMode) NONULL;
+target = DATA CorrectionTarget (NoiseMode);
+nameTarget 'Цель' (NoiseMode m) = staticCaption(target(m)) CHARWIDTH 12;
+noise 'Шум (0..1)' = DATA DOUBLE (NoiseMode);
+CONSTRAINT NoiseMode m IS NoiseMode AND timeFrom(m) > timeTo(m)
+    MESSAGE 'Начало режима шума должно быть не позже окончания';
+// По умолчанию при создании: цель — к границе, шум — как у организации
+WHEN SET(NoiseMode m IS NoiseMode) AND NOT target(m) DO target(m) <- CorrectionTarget.toLimit;
+WHEN SET(NoiseMode m IS NoiseMode) AND NOT noise(m) DO noise(m) <- noise(organization(m));
+
+// Выбор режима шума на датчике (по умолчанию не выбран -> обычное поведение)
+noiseMode 'Режим шума' = DATA NoiseMode (Device);
+nameNoiseMode 'Режим шума' (Device d) = name(noiseMode(d)) CHARWIDTH 15;
+CONSTRAINT noiseMode(Device d) AND organization(noiseMode(d)) != organization(d)
+    MESSAGE 'Режим шума должен принадлежать организации датчика';
+
+// Активный режим датчика в момент zdt (если окно покрывает время)
+activeNoiseMode (Device d, ZDATETIME zdt) =
+    noiseMode(d) IF TIME(zdt) >= timeFrom(noiseMode(d)) AND TIME(zdt) <= timeTo(noiseMode(d));
+// Цель корректировки: цель активного режима, иначе — к границе (обычное поведение)
+correctionTarget (Device d, ZDATETIME zdt) = OVERRIDE target(activeNoiseMode(d, zdt)), CorrectionTarget.toLimit;
+// Шум по времени: шум активного режима, иначе — обычный шум организации
+noise (Device d, MeasurementType mt, ZDATETIME zdt) = OVERRIDE noise(activeNoiseMode(d, zdt)), noise(d, mt);
+// Время-зависимый разброс; НЕ MATERIALIZED
+noiseValue (Device d, MeasurementType mt, ZDATETIME zdt) = (maxAdjFixedValue(d, mt) - minAdjFixedValue(d, mt)) * noise(d, mt, zdt);
+// Середина диапазона и цели: к границе минус шум, либо к середине (по цели режима)
+midAdjValue (Device d, MeasurementType mt) = (minAdjFixedValue(d, mt) + maxAdjFixedValue(d, mt)) / 2;
+upperTarget (Device d, MeasurementType mt, ZDATETIME zdt) =
+    IF correctionTarget(d, zdt) = CorrectionTarget.toMiddle THEN midAdjValue(d, mt) ELSE maxAdjFixedValue(d, mt) - noiseValue(d, mt, zdt);
+lowerTarget (Device d, MeasurementType mt, ZDATETIME zdt) =
+    IF correctionTarget(d, zdt) = CorrectionTarget.toMiddle THEN midAdjValue(d, mt) ELSE minAdjFixedValue(d, mt) + noiseValue(d, mt, zdt);
+
+timeFrom(Device d, ZDATETIME zdt) = timeFrom(location(d), DATE(zdt));
+timeTo(Device d, ZDATETIME zdt) = timeTo(location(d), DATE(zdt));
+adjustTimeFrom(Device d, MeasurementType mt, ZDATETIME zdt) = sumMinutes(timeFrom(d, zdt), -periodMinutes(d, mt));
+adjustTimeTo(Device d, MeasurementType mt, ZDATETIME zdt) = sumMinutes(timeTo(d,zdt), periodMinutes(d, mt));
+// Окно активности с учётом перехода через полночь: если начало > конец, окно «через 00:00» (контролируем [начало..24] И [00..конец])
+inAdjustWindow(Device d, MeasurementType mt, ZDATETIME zdt) =
+    IF adjustTimeFrom(d, mt, zdt) <= adjustTimeTo(d, mt, zdt)
+        THEN TIME(zdt) >= adjustTimeFrom(d, mt, zdt) AND TIME(zdt) <= adjustTimeTo(d, mt, zdt)
+        ELSE TIME(zdt) >= adjustTimeFrom(d, mt, zdt) OR TIME(zdt) <= adjustTimeTo(d, mt, zdt);
+// Секунды с начала окна с учётом перехода через полночь (после 00:00 добавляем сутки)
+elapsedFromStart(Device d, MeasurementType mt, ZDATETIME zdt) =
+    IF TIME(zdt) >= timeFrom(d, zdt) THEN subtractSeconds(TIME(zdt), timeFrom(d, zdt))
+        ELSE subtractSeconds(TIME(zdt), timeFrom(d, zdt)) + 86400;
+
+adjust(Device d, MeasurementType mt, DOUBLE prevValueToTarget, INTEGER secondsToTarget, ZDATETIME zdt) =
+    IF secondsToTarget <= measurementPeriod(d) OR abs(prevValueToTarget) <= noiseValue(d, mt, zdt) THEN 0.0
+        ELSE exp(ln(noiseValue(d, mt, zdt) / abs(prevValueToTarget)) / round0(secondsToTarget / measurementPeriod(d))) * prevValueToTarget;
+adjustTargetValue(DOUBLE target, Device d, MeasurementType mt, INTEGER secondsToTarget, ZDATETIME zdt) = target - adjust(d, mt, target - prevLastValue(d, mt), secondsToTarget, zdt) + (random() - 0.5) * noiseValue(d, mt, zdt);
+
+// Вспомогательный clamp: при выходе за границу тянем к цели (граница или середина — по режиму датчика). Шум — по времени.
+adjustTargetValue(Device d, MeasurementType mt, ZDATETIME zdt, DOUBLE v) =
+        IF inAdjustWindow(d, mt, zdt) AND v IS DOUBLE THEN
+            CASE WHEN adjustTimeFrom(d, mt, zdt) <= adjustTimeTo(d, mt, zdt) AND TIME(zdt) > timeTo(location(d), DATE(zdt)) THEN adjustTargetValue(v, d, mt, subtractSeconds(TIME(zdt), adjustTimeTo(d, mt, zdt)), zdt) // we're coming back (только для окна в пределах суток)
+                 WHEN v > maxAdjFixedValue(d, mt) THEN min(adjustTargetValue(upperTarget(d, mt, zdt), d, mt, elapsedFromStart(d, mt, zdt), zdt), v)
+                 WHEN v < minAdjFixedValue(d, mt) THEN max(adjustTargetValue(lowerTarget(d, mt, zdt), d, mt, elapsedFromStart(d, mt, zdt), zdt), v)
+                 ELSE v;
+
+// Применяем зажатие по расписанию во время финальной корректировки измерений
+finalAdjustValue(Measurement m, MeasurementType mt, DOUBLE v) += adjustTargetValue(device(m), mt, dateTime(m), v);
+
+container 'ID контейнера' = DATA INTEGER (Device);
+
+overDeviceName(ControllerManager cm) += '(контейнер ' + container(templateDevice(cm)) + ')';
+
+// UI (точка размещения): все настройки расписания переносим в форму точек размещения
+// - базовые расписания по дням недели (выводим селекторы, организация берётся из organization(l))
+// - локальное переопределение на конкретную дату (редактируемое свойство dataScheduleFor)
+// - справочник расписаний AdjustSchedule (NEW/DELETE)
+// доп. даты для формы «Переопределения по датам» — расширяется модулями (бот добавляет прошлые даты с выездами/приездами)
+dateRowExtra = ABSTRACT BOOLEAN (Location, DATE);
+EXTEND FORM locations
+    OBJECTS ds = DATE
+    FILTERS iterate(ds, currentDate(), sum(currentDate(), 60)) OR dataScheduleFor(l, ds) OR dateRowExtra(l, ds)
+    PROPERTIES VALUE(ds), nameScheduleFor(l, ds), timeFrom(l, ds), timeTo(l, ds), noise(o), periodMinutes(o)
+
+    OBJECTS dow = DOW
+    PROPERTIES (dow) READONLY caption, numberM
+    PROPERTIES (l, dow) reportDeparture, reportArrival, nameAdjustSchedule
+    ORDERS numberM(dow)
+
+    OBJECTS as = AdjustSchedule
+    FILTERS organization(as) = o
+    PROPERTIES (as) name, timeFrom, timeTo, NEW, DELETE
+
+    OBJECTS nm = NoiseMode
+    FILTERS organization(nm) = o
+    PROPERTIES (nm) name, timeFrom, timeTo, nameTarget, noise, NEW, DELETE
+
+    OBJECTS d = Device
+    PROPERTIES(d) id, container, nameType, nameNoiseMode SHOWIF notLogistUser(), NEW, DELETE
+    FILTERS location(d) == l
+;
+
+DESIGN locations {
+    tab {
+        NEW adjustPanel {
+            caption = 'Параметры корректировки';
+            NEW orgRow {
+                showIf = notLogistUser();
+                horizontal = TRUE;
+                caption = 'По умолчанию для организации';
+                MOVE PROPERTY(noise(o));
+                MOVE PROPERTY(periodMinutes(o));
+            }
+            NEW schedulesRow {
+                showIf = notLogistUser();
+                horizontal = TRUE;
+                fill = 1;
+                MOVE BOX(as) { fill = 1; caption = 'Расписания корректировки'; }
+                MOVE BOX(nm) { fill = 1; caption = 'Режимы шума (имя + время + шум; выбираются на датчике)'; }
+            }
+        }
+    }
+    BOX(l) {
+        NEW tabll {
+            fill = 1;
+            tabbed = TRUE;
+            MOVE BOX(d) {
+                caption = 'Датчики';
+            }
+            NEW dateRow {
+                showIf = notLogistUser();
+                caption = 'Расписания корректировки';
+                horizontal = TRUE;
+                NEW weeklyDefaults {
+                    caption = 'По умолчанию по дням недели';
+                    fill = 1;
+                    MOVE BOX(dow) {
+                        caption = 'Расписания по дням недели';
+                        PROPERTY(caption(dow)) { caption = 'День недели'; }
+                    }
+                }
+                MOVE BOX(ds) {
+                    caption = 'Переопределения по датам';
+                    fill = 1;
+                }
+            }
+            NEW templates {
+                showIf = notLogistUser();
+                caption = 'Шаблоны управления';
+                MOVE BOX(tm);
+            }
+        }
+    }
+}
+
+///// КОРРЕКТИРОВКА ЗАДНИМ ЧИСЛОМ /////
+
+isAdjustActive 'Корр. активна' (Device d, MeasurementType mt) =
+    adjustConfigured(d, mt) AND inAdjustWindow(d, mt, currentZDateTime());
+
+retroDateFrom 'Период с' = DATA LOCAL ZDATETIME ();
+retroDateTo 'Период по' = DATA LOCAL ZDATETIME ();
+retroDataMaxValue 'Макс. (корр.)' = DATA LOCAL DOUBLE (MeasurementType);
+retroDataMinValue 'Мин. (корр.)' = DATA LOCAL DOUBLE (MeasurementType);
+retroMaxValue 'Макс. (корр.)' (Device d, MeasurementType mt) = OVERRIDE retroDataMaxValue(mt), maxAdjFixedValue(d, mt);
+retroMinValue 'Мин. (корр.)' (Device d, MeasurementType mt) = OVERRIDE retroDataMinValue(mt), minAdjFixedValue(d, mt);
+retroNoiseValue (Device d, MeasurementType mt) = OVERRIDE (retroMaxValue(d, mt) - retroMinValue(d, mt)) * noise(d, mt), 0.0;
+// Разброс задним числом с учётом интервала корректировки по времени суток
+retroNoiseValue (Device d, MeasurementType mt, ZDATETIME zdt) = OVERRIDE (retroMaxValue(d, mt) - retroMinValue(d, mt)) * noise(d, mt, zdt), 0.0;
+
+applyRetroAdjust 'Применить корректировку' (Device d) {
+    ASK 'Применить корректировку задним числом для датчика ' + id(d) + '?' DO {
+        value(Measurement m, MeasurementType mt) <-
+                IF correctionTarget(d, dateTime(m)) = CorrectionTarget.toMiddle
+                    THEN (retroMinValue(d, mt) + retroMaxValue(d, mt)) / 2 + (random() - 0.5) * retroNoiseValue(d, mt, dateTime(m))
+                    ELSE (IF value(m, mt) > retroMaxValue(d, mt)
+                              THEN retroMaxValue(d, mt) - retroNoiseValue(d, mt, dateTime(m)) * random()
+                              ELSE retroMinValue(d, mt) + retroNoiseValue(d, mt, dateTime(m)) * random())
+            WHERE device(m) = d AND dateTime(m) >= retroDateFrom() AND dateTime(m) <= retroDateTo() AND
+                  number(type(d), mt) AND
+                  ((retroMaxValue(d, mt) AND value(m, mt) > retroMaxValue(d, mt)) OR
+                   (retroMinValue(d, mt) AND value(m, mt) < retroMinValue(d, mt)));
+    }
+}
+
+generateRetroMeasurements 'Сгенерировать (задним числом)' (Device d) {
+    IF measurementPeriod(d) > 0 AND retroDateFrom() AND retroDateTo() THEN {
+        ASK 'Сгенерировать измерения для датчика ' + id(d) + ' в периоде с ' + retroDateFrom() + ' по ' + retroDateTo() + '?' DO {
+            LOCAL dt = ZDATETIME ();
+            dt() <- retroDateFrom();
+            LOCAL mPeriod = LONG ();
+            mPeriod() <- LONG(measurementPeriod(d));
+            WHILE dt() <= retroDateTo() DO {
+                IF NOT (GROUP SUM 1 IF device(Measurement m) = d AND dateTime(m) >= sumSeconds(dt(), -(mPeriod()-1)/2) AND dateTime(m) <= sumSeconds(dt(), mPeriod()/2)) THEN {
+                    NEW m = Measurement {
+                        device(m) <- d;
+                        dateTime(m) <- dt();
+
+                        FOR number(type(d), MeasurementType mt) DO {
+                            LOCAL mPrev = Measurement ();
+                            mPrev() <- (GROUP LAST Measurement mp ORDER dateTime(mp), mp WHERE device(mp) = d AND dateTime(mp) < dateTime(m) AND value(mp, mt));
+    
+                            LOCAL mNext = Measurement ();
+                            mNext() <- (GROUP LAST Measurement mn ORDER DESC dateTime(mn), mn WHERE device(mn) = d AND dateTime(mn) > dateTime(m) AND value(mn, mt));
+    
+                            IF value(mPrev(), mt) AND value(mNext(), mt) THEN {
+                                value(m, mt) <- value(mPrev(), mt) + (value(mNext(), mt) - value(mPrev(), mt)) * DOUBLE(subtractSeconds(dateTime(m), dateTime(mPrev()))) / DOUBLE(subtractSeconds(dateTime(mNext()), dateTime(mPrev()))) + (random() - 0.5) * retroNoiseValue(d, mt, dateTime(m));
+                            } ELSE IF value(mPrev(), mt) THEN {
+                                value(m, mt) <- value(mPrev(), mt) + (random() - 0.5) * retroNoiseValue(d, mt, dateTime(m));
+                            } ELSE IF value(mNext(), mt) THEN {
+                                value(m, mt) <- value(mNext(), mt) + (random() - 0.5) * retroNoiseValue(d, mt, dateTime(m));
+                            }
+                        }
+                    }
+                }
+                dt() <- sumSeconds(dt(), mPeriod());
+            }
+        }
+    }
+}
+
+EXTEND FORM devices
+    OBJECTS rcmt = MeasurementType
+    FILTERS number(type(d), rcmt)
+    PROPERTIES (rcmt) READONLY name
+    PROPERTIES (d, rcmt) READONLY isAdjustActive, maxAdjFixedValue, minAdjFixedValue
+    PROPERTIES (d, rcmt) retroMaxValue, retroMinValue
+    PROPERTIES retroDateFrom(), retroDateTo()
+    PROPERTIES (d) PANEL nameNoiseMode, applyRetroAdjust, generateRetroMeasurements
+;
+
+DESIGN devices {
+    tab {
+        NEW adjustment {
+            caption = 'Корректировка';
+            showIf = notLogistUser();
+            horizontal = FALSE;
+            fill = 1;
+            NEW noiseModeRow {
+                showIf = notLogistUser();
+                horizontal = TRUE;
+                caption = 'Режим шума прибора';
+                MOVE PROPERTY(nameNoiseMode(d));
+            }
+            NEW retroPeriodBox {
+                showIf = notLogistUser();
+                caption = 'Период корректировки задним числом';
+                horizontal = TRUE;
+                MOVE PROPERTY(retroDateFrom());
+                MOVE PROPERTY(retroDateTo());
+                MOVE PROPERTY(applyRetroAdjust(d));
+                MOVE PROPERTY(generateRetroMeasurements(d));
+            }
+            MOVE BOX(rcmt) {
+                showIf = notLogistUser();
+                fill = 1;
+            }
+        }
+    }
+}
+
+GROUP root;
+GROUP result : root;
+
+GROUP json;
+
+//code = DATA LOCAL STRING(INTEGER);
+date = DATA LOCAL DATETIME (INTEGER);
+imei = DATA LOCAL STRING(INTEGER);
+value = DATA LOCAL STRING(INTEGER);
+
+countImei = GROUP SUM 1 BY imei(INTEGER row);
+
+FORM importResults
+    OBJECTS items = INTEGER IN result
+
+//    PROPERTIES(items) code
+    PROPERTIES(items) IN json date, value, imei
+    FILTERS imported(items);
+    
+GROUP nav 'Параметры импорта БТС';
+navLogin 'Логин доступа' = DATA STRING () IN nav;
+navPassword 'Пароль доступа' = DATA STRING () IN nav;
+lastImportTime 'Последнее время импорта' = DATA DATETIME () IN nav;
+
+importMeasurements 'Импортировать измерения' () {
+    LOCAL token = STRING (); 
+
+    EXTERNAL HTTP 'https://api.nav.by/info/integration_get_token.php?type=GET_TOKEN&login=$1&password=$2' PARAMS navLogin(), navPassword() TO exportFile;
+    IF failedHttp() THEN {
+        MESSAGE 'Unable to get token ' + statusHttp() + '\n' + STRING(JSONFILE(exportFile())) NOWAIT;
+        RETURN;
+    }
+    
+    IMPORT JSON FROM exportFile() TO () token;
+    
+    EXTERNAL HTTP 'https://api.nav.by/info/integration.php?type=EVENTS&token=$1&event_codes=temp_sensor1&datetime=$2&limit=ALL' PARAMS token(), (OVERRIDE lastImportTime(),1982_01_01_12:00) TO exportFile;
+
+    IF failedHttp() THEN {
+        MESSAGE 'Unable to get data ' + statusHttp() + '\n' + STRING(JSONFILE(exportFile())) NOWAIT;
+        RETURN;
+    }
+    
+    IMPORT importResults JSON FROM exportFile();
+    
+    LOCAL missingImeis = STRING ();
+    missingImeis() <- GROUP CONCAT STRING imei IF countImei(imei) AND NOT deviceBySimID(imei), ', ' ORDER imei;
+    IF missingImeis() THEN {
+        MESSAGE 'IMEIs not found : ' + missingImeis() NOWAIT;        
+        RETURN;
+    }
+    
+    FOR Device dv = deviceBySimID(imei(INTEGER row)) AND NOT disableImport(dv) DO {
+        NEW m = Measurement { 
+            dateTime(m) <- ZDATETIME(date(row)); 
+            device(m) <- dv; 
+            idImport(m) <- LONG(imei(row)); 
+            unAdjustedValue(m, temperatureType()) <- DOUBLE(value(row)); 
+        }
+    }
+    lastImportTime() <- currentDateTime();
+    APPLY;
+}
+
+GROUP ftp 'Параметры импорта FTP';
+importFTPPath 'Путь к файлу импорта' = DATA STRING () IN ftp;
+importExtraFTPPath 'Путь к файлу импорта (доп.)' = DATA STRING () IN ftp;
+
+importFTPMeasurements (STRING path) {
+    LOCAL token = STRING (); 
+
+    READ path TO exportFile;
+//    IF failedHttp() THEN {
+//        MESSAGE 'Unable to get token ' + statusHttp() + '\n' + STRING(JSONFILE(exportFile())) NOWAIT;
+//        RETURN;
+//    }
+    
+    LOCAL NESTED eui64 = STRING (INTEGER);
+    LOCAL NESTED tmmeasure = LONG (INTEGER);
+    LOCAL NESTED temperatur = DOUBLE (INTEGER);
+    LOCAL NESTED humidity = DOUBLE (INTEGER);
+    LOCAL NESTED battery = DOUBLE (INTEGER);
+    IMPORT DBF FROM exportFile() TO eui64, tmmeasure, temperatur, humidity, battery 
+    
+    LOCAL missingEui64 = STRING ();
+    missingEui64() <- GROUP CONCAT STRING eui64 IF [GROUP SUM 1 IF eui64(INTEGER row) = eui64]() AND NOT deviceBySimID(eui64), ', ' ORDER eui64;
+    IF missingEui64() THEN {
+        MESSAGE 'EUI64s not found : ' + missingEui64() NOWAIT;        
+        RETURN;
+    }
+    
+    FOR [GROUP SUM 1 IF Device dv = deviceBySimID(eui64(INTEGER row)) AND ZDATETIME tz = toZDateTime(tmmeasure(row)) AND (tz > dateTime(lastMeasurement(dv)) OR NOT lastMeasurement(dv)) BY dv](Device dv) AND NOT disableImport(dv) DO {
+        APPLY FOR dv = deviceBySimID(eui64(INTEGER row)) AND ZDATETIME tz = toZDateTime(tmmeasure(row)) AND (tz > dateTime(lastMeasurement(dv)) OR NOT lastMeasurement(dv)) INLINE NEW m = Measurement DO {
+            dateTime(m) <- tz;
+            device(m) <- dv;
+            //            idImport(m) <- LONG(eui64(row)); 
+            unAdjustedValue(m, temperatureType()) <- DOUBLE(temperatur(row));
+            unAdjustedValue(m, humidityType()) <- DOUBLE(humidity(row));
+            unAdjustedValue(m, batteryType()) <- DOUBLE(battery(row));
+        }
+        IF canceled() THEN
+            BREAK;
+    }
+    IF NOT canceled() THEN 
+        delete(path);
+}
+importFTPMeasurements 'Импортировать измерения' () {
+    IF importFTPPath() THEN 
+       importFTPMeasurements(importFTPPath());
+}
+importExtraFTPMeasurements 'Импортировать измерения (доп.)' () {
+    IF importExtraFTPPath() THEN
+        importFTPMeasurements(importExtraFTPPath());
+}
+
+EXTEND FORM options
+    PROPERTIES () navLogin, navPassword, lastImportTime, importMeasurements, importFTPPath, importExtraFTPPath, importFTPMeasurements, importExtraFTPMeasurements 
+;
+DESIGN options {
+    pane {
+        NEW hnav {
+            caption = 'Параметры импорта БТС'; 
+            MOVE PROPERTY(navLogin());
+            MOVE PROPERTY(navPassword());
+            MOVE PROPERTY(lastImportTime());
+            MOVE PROPERTY(importMeasurements());
+        }
+        NEW hftp {
+            caption = 'Параметры импорта FTP'; 
+            MOVE PROPERTY(importFTPPath());
+            MOVE PROPERTY(importExtraFTPPath());
+            MOVE PROPERTY(importFTPMeasurements());
+            MOVE PROPERTY(importExtraFTPMeasurements());            
+        }
+    }
+}
+
+excludeFromPrintMeasurements 'Искл. из отчета изм. (NEW)' = DATA BOOLEAN (Device);
+ 
+FORM printMeasurements
+    OBJECTS dFrom = ZDATETIME PANEL, dTo = ZDATETIME PANEL, o = Organization PANEL
+    PROPERTIES name(o)
+    OBJECTS d = Device
+    FILTERS organization(d) = o, NOT excludeFromPrintMeasurements(d) 
+    OBJECTS m = Measurement SUBREPORT
+    FILTERS dateTime(m) >= dFrom AND dateTime(m) <= dTo
+    FILTERS device(m) = d
+    PROPERTIES deviceId(m), dateTime(m), nameDeviceType(m), temp = value(m, temperatureType()), hum = value(m, humidityType())
+;
+
+emailMeasurements 'Отправить измерения (NEW)' (Organization o, ZDATETIME dFrom, ZDATETIME dTo) {
+    PRINT printMeasurements OBJECTS o = o, dFrom = dFrom, dTo = dTo PDF TO exportFile;
+    EMAIL 
+            SUBJECT ('Отчет об измерениях: ' + DATETIME(dFrom) + ' - ' + DATETIME(dTo)) 
+            TO email(o)
+            BODY 'Добрый день, <br/><br/>Отчет по датчикам: ' + (GROUP CONCAT '' + id(Device d) IF organization(d) = o AND NOT excludeFromPrintMeasurements(d), ';<br/>' ORDER d) + '<br/>' + ' в приложении. <br/><br/><br/>С уважением, <br/>Команда MITE' 
+            ATTACH exportFile() NAME 'ДоминантаФарм_' + DATE(DATETIME(dFrom)) + (IF DATE(DATETIME(dTo)) != DATE(DATETIME(dFrom)) THEN '-' + DATE(DATETIME(dTo)) ELSE ''); 
+}
+
+printMeasurements 'Распечатать измерения (NEW)' (Organization o) {
+    DIALOG dialogZDateTimes OBJECTS dFrom = subtractSeconds(currentZDateTime(), 60*60) INPUT, dTo INPUT DO
+        PRINT printMeasurements OBJECTS o = o, dFrom = dFrom, dTo = dTo;
+}
+
+emailMeasurements 'Отправить измерения (NEW)' (Organization o) {
+    DIALOG dialogZDateTimes OBJECTS dFrom = subtractSeconds(currentZDateTime(), 60*60) INPUT, dTo INPUT DO
+        emailMeasurements(o, dFrom, dTo);
+}
+
+emailMeasurementsScheduler 'Отправить измерения из планировщика' (STRING[100] organizationName) {
+    IF NOT Organization.organization(organizationName) THEN {
+        MESSAGE 'Не найдена организация: ' + organizationName;
+        RETURN;
+    }
+
+    emailMeasurements(Organization.organization(organizationName), subtractSeconds(currentZDateTime(), 24 * 60 * 60), currentZDateTime());
+}
+
+EXTEND FORM devices
+    PROPERTIES excludeFromPrintMeasurements(d)
+;
+
+EXTEND FORM organizations
+    PROPERTIES (o) printMeasurements TOOLBAR, emailMeasurements TOOLBAR
+;
+
+reportTime 'Время отчета' = DATA TIME (Organization);
+
+routeReportDevice(Device d, MeasurementType mt) = machineLocation(d) AND number(type(d), mt) AND minReportFixedValue(d, mt) AND maxReportFixedValue(d, mt);
+hasRouteReportDevice(Location l, MeasurementType mt) = GROUP MAX routeReportDevice(Device d, mt) AND machineLocation(d) = l;
+// формат температуры: целое -> "2", дробное -> "3.5" (округление до 0.1 без лишнего ".0")
+tempStr (DOUBLE x) = (IF round1(x) = round0(x) THEN ('' + round0(x)) ELSE ('' + round1(x)));
+routeReportInterval 'Интервал' (Device d, MeasurementType mt) =
+    r'От ' + tempStr(minReportFixedValue(d, mt)) + r' до ' + tempStr(maxReportFixedValue(d, mt)) IF routeReportDevice(d, mt) MATERIALIZED;
+routeReportIntervalValue 'Интервал' (STRING interval) = interval IF interval IS STRING;
+hasRouteReportInterval(Organization o, MeasurementType mt, STRING interval) =
+    GROUP MAX routeReportDevice(Device d, mt) AND organization(d) = o AND routeReportInterval(d, mt) = interval;
+
+// (dataReportTimeFrom/To и reportTimeFrom/To определены выше, в блоке расписания «для отчёта» — до формы)
+// Точка расширения для бота «выезд/приезд» (реализация — модуль MachineBot): время из телеграма перебивает плановое от-до
+botRouteTimeFrom = ABSTRACT TIME (Location, DATE);
+botRouteTimeTo = ABSTRACT TIME (Location, DATE);
+botRouteEndDateTime = ABSTRACT ZDATETIME (Location, DATE);   // реальный конец рейса как datetime (для рейсов через полночь / многодневных)
+// Рейс «открыт»: выехал, реального приезда ещё нет (реализуется в MachineBot). Пока открыт — время приезда и мин-макс в отчёте пустые.
+routeTripOpen = ABSTRACT BOOLEAN (Location, DATE);
+// Дата ВЫЕЗДА рейса, покрывающего день d (реализуется в MachineBot). Для однодневного = d; для многодневного на последующих сутках = более ранняя дата выезда.
+routeTripStartDate = ABSTRACT DATE (Location, DATE);
+routeTimeFrom 'Время начала маршрута' (Location l, DATE d) = OVERRIDE botRouteTimeFrom(l, d), reportTimeFrom(l, d), timeFrom(l, d) COMPLEX;
+routeTimeTo 'Время окончания маршрута' (Location l, DATE d) = (OVERRIDE botRouteTimeTo(l, d), reportTimeTo(l, d), timeTo(l, d)) IF NOT routeTripOpen(l, d) COMPLEX;
+// Конец окна маршрута как полный datetime: реальный приезд бота, иначе плановое окончание (с переносом на следующие сутки при переходе через полночь)
+routeEndDateTime (Location l, DATE d) = (OVERRIDE botRouteEndDateTime(l, d),
+    (IF routeTimeTo(l, d) >= routeTimeFrom(l, d) THEN ZDATETIME(toDateTime(d, routeTimeTo(l, d)))
+        ELSE ZDATETIME(toDateTime(sum(d, 1), routeTimeTo(l, d))))) IF NOT routeTripOpen(l, d) COMPLEX;
+inRouteReportPeriod(Measurement m, MeasurementType mt, Location l, DATE d) =
+    machineLocation(device(m, mt)) = l AND
+    // Константные границы по дате (день d плюс до 5 суток на многодневный рейс): даёт планировщику использовать индекс (device, dateTime) вместо seq scan по всей истории измерений
+    dateTime(m, mt) >= ZDATETIME(toDateTime(d, 00:00)) AND dateTime(m, mt) < ZDATETIME(toDateTime(sum(d, 5), 00:00)) AND
+    // Точные границы: от выезда до реального приезда (через полночь / многодневный)
+    dateTime(m, mt) >= ZDATETIME(toDateTime(d, routeTimeFrom(l, d))) AND dateTime(m, mt) <= routeEndDateTime(l, d);
+routeReportFactMinValue 'Мин. реальное значение' (Location l, STRING interval, MeasurementType mt, DATE d) =
+    GROUP MIN value(Measurement m, mt) IF inRouteReportPeriod(m, mt, l, d) AND routeReportInterval(device(m, mt), mt) = interval;
+routeReportFactMaxValue 'Макс. реальное значение' (Location l, STRING interval, MeasurementType mt, DATE d) =
+    GROUP MAX value(Measurement m, mt) IF inRouteReportPeriod(m, mt, l, d) AND routeReportInterval(device(m, mt), mt) = interval;
+routeReportFactInterval 'Фактический интервал' (Location l, STRING interval, MeasurementType mt, DATE d) =
+    OVERRIDE (r'От ' + tempStr(routeReportFactMinValue(l, interval, mt, d)) + r' до ' + tempStr(routeReportFactMaxValue(l, interval, mt, d))) IF routeReportFactMinValue(l, interval, mt, d), r'—';
+// короткий формат даты дд/мм (из ISO «2026-07-06» → «06/07») — чтобы влезало в узкую колонку времени
+ddmm (DATE dd) = right(r'' + dd, 2) + r'/' + left(right(r'' + dd, 5), 2);
+// Многодневный рейс показывается на ОБОИХ днях: день выезда — время выезда + «—» в окончании/мин-макс (рейс ещё не закончился);
+// день ПРИЕЗДА — дата начала (дд/мм) в «Начало», время приезда в «Окончание», мин/макс за весь период командировки.
+// Обычный однодневный рейс — время выезда/приезда + мин-макс в тот же день.
+// Дата приезда рейса, ПОКРЫВАЮЩЕГО день d (по дате его выезда); для многодневного на дне выезда/промежуточном она > d.
+routeTripArrivalDate (Location l, DATE d) = DATE(routeEndDateTime(l, routeTripStartDate(l, d)));
+// «Начало» показываем СРАЗУ (выезд известен в момент выезда): для дня приезда многодневного — дата выезда,
+// иначе — время выезда. «—» остаётся только у «Окончания» и мин/макс, пока рейс не закрыт приездом.
+routeReportStart 'Начало' (Location l, DATE d) =
+    IF routeTripStartDate(l, d) < d THEN ddmm(routeTripStartDate(l, d)) ELSE left(r'' + routeTimeFrom(l, d), 5);
+// «Окончание»: рейс ещё в пути в этот день (приезд позже d или рейс не закрыт) → «—»; в день приезда — время приезда рейса.
+routeReportEndTime 'Окончание' (Location l, DATE d) = IF NOT routeTripArrivalDate(l, d) OR routeTripArrivalDate(l, d) > d THEN r'—'
+    ELSE left(r'' + routeTimeTo(l, routeTripStartDate(l, d)), 5);
+// Мин/макс — только в день ПРИЕЗДА (пройден весь маршрут), за весь период рейса (от даты выезда); иначе «—».
+routeReportFactDisplay 'Фактический интервал' (Location l, STRING interval, MeasurementType mt, DATE d) =
+    OVERRIDE (routeReportFactInterval(l, interval, mt, routeTripStartDate(l, d)) IF routeTripArrivalDate(l, d) = d), r'—';
+
+reportControl 'Контроль' (Device dev, MeasurementType mt, ZDATETIME zdt) =
+    value(dev, mt, zdt) >= minReportFixedValue(dev, mt) AND value(dev, mt, zdt) <= maxReportFixedValue(dev, mt);
+
+FORM limitReport 'Отчет по значениям до корректировки'
+    OBJECTS d = DATE PANEL, o = Organization PANEL
+    PROPERTIES(d) date = VALUE
+
+    PROPERTIES(o) name SELECTOR
+    OBJECTS m = (dev = Device, mt = MeasurementType)
+    PROPERTIES(dev) id, container, name
+    PROPERTIES(mt) mtName = name
+    PROPERTIES val = tempStr(value(dev, mt, ZDATETIME(toDateTime(d, reportTime(o))))), dateTime = ZDATETIME(toDateTime(d, reportTime(o))), time = reportTime(o)
+    PROPERTIES minLimit = tempStr(minReportFixedValue(dev, mt)), maxLimit = tempStr(maxReportFixedValue(dev, mt))
+    PROPERTIES control = reportControl(dev, mt, ZDATETIME(toDateTime(d, reportTime(o))))
+    ORDERS container(dev)
+    FILTERS organization(dev) == o, container(dev),
+            minReportFixedValue(dev, mt) AND maxReportFixedValue(dev, mt)
+;
+
+emailLimitReport 'Отправить отчет по значениям до корректировки' (Organization o, DATE d) {
+    PRINT limitReport OBJECTS d = d, o = o PDF TO exportFile;
+    EMAIL
+            SUBJECT ('MITE report: ' + name(o) + ', ' + d)
+            TO email(o)
+            BODY ('Automated report from MITE.<br/>Organization: ' + name(o) + '<br/>Report date: ' + d + '<br/>Attachment: Утренняя температура в контейнерах.')
+            ATTACH exportFile() NAME ('mite_limit_report_' + replace(name(o), ' ', '_') + '_' + d);
+}
+
+runLimitReport 'Сформировать' (Organization o) {
+    DIALOG dialogDateIot OBJECTS d = currentDate() INPUT DO
+        PRINT limitReport OBJECTS d = d, o = o;
+}
+
+emailLimitReportScheduler 'Отправить отчет по значениям до корректировки из планировщика' (STRING[100] organizationName) {
+    IF NOT Organization.organization(organizationName) THEN {
+        MESSAGE 'Не найдена организация: ' + organizationName;
+        RETURN;
+    }
+
+    emailLimitReport(Organization.organization(organizationName), currentDate());
+}
+
+FORM routeReportDialog 'Параметры отчета по маршрутам'
+    OBJECTS d = DATE PANEL, mt = MeasurementType PANEL
+    PROPERTIES(d) VALUE
+    PROPERTIES(mt) name SELECTOR
+;
+
+routeControl 'Контроль' (Location ml, MeasurementType mt, DATE d) =
+    NOT (GROUP SUM 1 IF inRouteReportPeriod(Measurement m, mt, ml, d) AND
+            (value(m, mt) < minReportFixedValue(device(m, mt), mt) OR value(m, mt) > maxReportFixedValue(device(m, mt), mt)));
+
+FORM routeReport 'Отчет контроля маршрутов'
+    OBJECTS d = DATE PANEL, o = Organization PANEL, mt = MeasurementType PANEL
+
+    // Режимы — колонками (одна строка на машину); лист портретный, колонки узкие, чтобы помещались
+    OBJECTS interval = STRING
+    FILTERS hasRouteReportInterval(o, mt, interval)
+
+    OBJECTS ml = Location
+    PROPERTIES machineName = name(ml)
+    PROPERTIES startCell = routeReportStart(ml, d), endCell = routeReportEndTime(ml, d)
+    PROPERTIES factInterval = routeReportFactDisplay(ml, interval, mt, d) COLUMNS (interval) HEADER routeReportIntervalValue(interval)
+    PROPERTIES control = routeControl(ml, mt, d)
+    FILTERS organization(ml) == o, machine(ml), hasRouteReportDevice(ml, mt), routeTimeFrom(ml, d)
+    ORDERS machineName
+;
+
+emailRouteReport 'Отправить отчет по маршрутам' (Organization o, DATE d, MeasurementType mt) {
+    PRINT routeReport OBJECTS d = d, o = o, mt = mt PDF TO exportFile;
+    EMAIL
+            SUBJECT ('MITE route report: ' + name(o) + ', ' + d + ', ' + name(mt))
+            TO email(o)
+            BODY ('Automated route report from MITE.<br/>Organization: ' + name(o) + '<br/>Report date: ' + d + '<br/>Measurement type: ' + name(mt) + '<br/>Attachment: Контроль маршрутов.')
+            ATTACH exportFile() NAME ('mite_route_report_' + replace(name(o), ' ', '_') + '_' + replace(name(mt), ' ', '_') + '_' + d);
+}
+
+runRouteReport 'Сформировать отчет по маршрутам' (Organization o) {
+    DIALOG routeReportDialog OBJECTS d = currentDate() INPUT, mt = temperatureType() INPUT DO
+        PRINT routeReport OBJECTS d = d, o = o, mt = mt;
+}
+
+emailRouteReport 'Отправить отчет по маршрутам' (Organization o) {
+    DIALOG routeReportDialog OBJECTS d = currentDate() INPUT, mt = temperatureType() INPUT DO
+        emailRouteReport(o, d, mt);
+}
+
+emailRouteReportScheduler 'Отправить отчет по маршрутам из планировщика' (STRING[100] organizationName) {
+    IF NOT Organization.organization(organizationName) THEN {
+        MESSAGE 'Не найдена организация: ' + organizationName;
+        RETURN;
+    }
+
+    emailRouteReport(Organization.organization(organizationName), currentDate(), temperatureType());
+}
+
+EXTEND FORM devices
+    PROPERTIES(o) reportTime, runLimitReport, runRouteReport, emailRouteReport
+    PROPERTIES(d, rcmt) minReportFixedValue, maxReportFixedValue
+;
+
+DESIGN devices {
+    adjustment {
+        NEW report {
+            caption = 'Отчеты корректировки';
+            horizontal = TRUE;
+            MOVE PROPERTY(reportTime(o));
+            MOVE PROPERTY(runLimitReport(o));
+            MOVE PROPERTY(runRouteReport(o));
+            MOVE PROPERTY(emailRouteReport(o));
+        }
+    }
+}
+
+getpackage(FILE file) {
+    printToLog('GETPACKAGE : ' + extension(file) + ' -> ' + STRING(RAWFILE(file)));
+} @@noauth;
+
+lagrangePoints = DATA LOCAL NESTED DOUBLE (DOUBLE);
+lagrangeResult = DATA LOCAL NESTED DOUBLE ();
+calcLagrange INTERNAL 'mite.LagrangeAction' (DOUBLE, INTEGER);
+
+run() {
+    LOCAL points = DOUBLE (TIME);
+    // points(04:00) <- 1; 
+    points(07:30) <- 22;
+    points(08:30) <- 8;
+    points(10:00) <- 4;
+    points(17:15) <- 7.9;
+    // points(19:00) <- 4; 
+
+    lagrangePoints(DOUBLE x) <- GROUP MAX points(TIME t) IF DOUBLE(toSeconds(t)) = x;
+
+    FOR value(Measurement m, MeasurementType mt) AND deviceId(m) = 1210000026 AND name(mt) = r'Температура'
+        AND dateTime(m, mt) > ZDATETIME(2022_04_25_00:00) AND dateTime(m, mt) < ZDATETIME(2022_04_25_23:35)
+        DO {
+
+        calcLagrange(DOUBLE(toSeconds(TIME(dateTime(m, mt)))), 1);
+
+        ASK 'Change \n DATE:' + dateTime(m, mt) + '\n OLD VALUE:' + value(m, mt) + '\n NEW VALUE' + lagrangeResult() DO {
+            APPLY value(m, mt) <- lagrangeResult();
+        } ELSE
+        BREAK ;
+    }
+}

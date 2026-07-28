@@ -1,0 +1,258 @@
+MODULE OrgMeasurement;
+
+REQUIRE OrgDevice, Measurement;
+
+NAMESPACE Measurement;
+
+measurementTypeString 'Типы измерений' (Device d) = GROUP CONCAT name(MeasurementType mt) IF number(type(d), mt), ',' ORDER number(type(d), mt) CHARWIDTH 20;
+
+organization(Measurement m) = organization(device(m));
+
+CLASS MeasurementLimit 'Порог измерения';
+organization = DATA Organization (MeasurementLimit);
+type = DATA MeasurementType (MeasurementLimit);
+value 'Значение' = DATA DOUBLE (MeasurementLimit);
+color 'Цвет в отчетах' = DATA COLOR (MeasurementLimit);
+icon 'Иконка на карте' = DATA IMAGEFILE (MeasurementLimit);
+limit(Organization org, MeasurementType type, DOUBLE value) = GROUP LAST MeasurementLimit limit ORDER value(limit), limit 
+                                                                                    WHERE value(limit) < value BY organization(limit), type(limit);
+colorLimit(Organization org, MeasurementType type, DOUBLE value) = color(limit(org, type, value));
+iconLimit(Organization org, MeasurementType type, DOUBLE value) = icon(limit(org, type, value));
+
+EXTEND FORM deviceTypes
+    OBJECTS ol = Organization PANEL
+    PROPERTIES (ol) name SELECTOR 
+    OBJECTS mct = MeasurementType PANEL
+    PROPERTIES (mct) name SELECTOR 
+
+    OBJECTS ml = MeasurementLimit
+    PROPERTIES (ml) value, color, icon, NEW, DELETE
+    FILTERS organization(ml) = ol, type(ml) = mct
+;
+
+DESIGN deviceTypes {
+    tab {
+        NEW limit {
+            horizontal = FALSE;
+            caption = 'Лимиты';
+            NEW panel {
+                horizontal = TRUE;
+                MOVE BOX (ol);
+                MOVE BOX (mct);
+            }
+            MOVE BOX (ml) {
+                fill = 1;
+            }
+            
+            fill = 1;        
+        }
+    }
+}
+
+// MAP
+
+iconLimit 'Иконка на карте' (Device d) = GROUP LAST IMAGEFILE i ORDER INTEGER n WHERE i = iconLimit(organization(d), MeasurementType type, lastValue(d, type)) AND n = number(type(d), type);
+background (Device d, MeasurementType type) += colorLimit(organization(d), type, lastValue(d, type));
+EXTEND FORM devices
+    PROPERTIES (d) icon = iconLimit
+;
+
+// REPORTS
+
+toDateTime(DATE date, INTEGER hour) = sumMinutes(ZDATETIME (date), hour * 60);
+between(ZDATETIME dateTime, DATE date, INTEGER hour) = dateTime >= toDateTime(date, hour) AND dateTime < toDateTime(date, hour + 1);  
+value(DATE date, INTEGER hour, Device d, MeasurementType mt) = 
+                round((GROUP SUM value(Measurement m, mt) IF between(dateTime(m, mt), date, hour) AND device(m, mt) = d) /
+                (GROUP SUM 1 IF between(dateTime(Measurement m), date, hour) AND device(m) = d), 2); 
+
+show 'Показывать в отчете' = DATA BOOLEAN (DeviceType, MeasurementType);
+show(DeviceType d, MeasurementType mt) => number(d, mt);
+EXTEND FORM deviceTypes
+    PROPERTIES (t, mt) show
+;
+
+FORM reportOrg
+    OBJECTS dFrom = DATE, dTo = DATE, d = Device, o = Organization SUBREPORT
+    
+    OBJECTS (dt = DATE, h = INTEGER)
+    FILTERS iterate(dt, dFrom, dTo) AND iterate(h, 0, 23)
+    
+    OBJECTS mt = MeasurementType
+    FILTERS show(type(d), mt)
+
+    PROPERTIES name 'Время' = DATETIME(toDateTime(dt, h))
+    PROPERTIES cl = colorLimit(o, mt, value(dt, h, d, mt)) COLUMNS (mt)
+    PROPERTIES value(dt, h, d, mt) COLUMNS (mt) HEADER name(mt)
+;
+
+exportReportXls(Organization o, DATE dFrom, DATE dTo) {
+    TRY delete('myfile.xlsx'); // if it wasn't deleted before
+    FOR organization(Device d) = o DO { 
+        PRINT reportOrg OBJECTS d = d, dFrom = dFrom, dTo = dTo, o = o XLSX SHEET 'Устройство ' + id(d) TO exportExcelFile;
+        WRITE exportExcelFile() TO 'myfile' APPEND;
+    }
+    READ 'myfile.xlsx' TO exportExcelFile;
+    delete('myfile.xlsx');
+}
+
+emailReportXls(Organization o, DATE dFrom, DATE dTo) {
+    exportReportXls(o, dFrom, dTo);
+    EMAIL TO email(o) ATTACH exportExcelFile();
+}
+
+printReportXls(Organization o, DATE dFrom, DATE dTo) {
+    exportReportXls(o, dFrom, dTo);
+    open(exportExcelFile());
+}
+
+FORM dialogDateIot
+    OBJECTS d = DATE PANEL
+    PROPERTIES(d) VALUE
+;
+
+FORM dialogDates
+    OBJECTS dFrom 'Дата от' = DATE PANEL, dTo 'Дата до' = DATE PANEL
+    PROPERTIES VALUE(dFrom), VALUE(dTo)
+;
+
+FORM dialogZDateTimes
+    OBJECTS dFrom 'Дата от' = ZDATETIME PANEL, dTo 'Дата до' = ZDATETIME PANEL
+    PROPERTIES VALUE(dFrom), VALUE(dTo)
+;
+
+emailReportXls 'Отправить измерения' (Organization o) {
+    DIALOG dialogDates OBJECTS dFrom INPUT, dTo INPUT DO
+        emailReportXls(o, dFrom, dTo);
+}
+
+printReportXls 'Распечатать измерения' (Organization o) {
+    DIALOG dialogDates OBJECTS dFrom INPUT, dTo INPUT DO
+        printReportXls(o, dFrom, dTo);
+}
+
+deleteFrom 'Удалить с' = DATA LOCAL ZDATETIME ();
+deleteTo 'Удалить по' = DATA LOCAL ZDATETIME ();
+deleteBatchDays 'Размер батча (дн.)' = DATA LOCAL INTEGER ();
+
+deleteMeasurements (Organization o, ZDATETIME dFrom, ZDATETIME dTo, INTEGER batchDays) {
+    LOCAL NESTED batchFrom = ZDATETIME ();
+    LOCAL NESTED batchTo = ZDATETIME ();
+    batchFrom() <- dFrom;
+    WHILE batchFrom() < dTo DO {
+        batchTo() <- MIN sumDay(batchFrom(), LONG(batchDays)), dTo;
+        APPLY DELETE Measurement m WHERE organization(m) = o AND dateTime(m) >= batchFrom() AND dateTime(m) < batchTo();
+        MESSAGE 'Удалены данные с даты : ' + batchFrom() + ' до даты : ' + batchTo() NOWAIT;
+        batchFrom() <- batchTo();
+    }
+}
+
+deleteMeasurements 'Удалить измерения' (Organization o) {
+    ASK 'Удалить измерения организации ' + name(o) + ' за период ' + deleteFrom() + ' — ' + deleteTo() + '?' DO
+        deleteMeasurements(o, deleteFrom(), deleteTo(), deleteBatchDays());
+}
+
+EXTEND FORM organizations
+//      PROPERTIES () deleteFrom, deleteTo, deleteBatchDays
+//      deleteMeasurements TOOLBAR
+        PROPERTIES (o) email, emailReportXls TOOLBAR, printReportXls TOOLBAR
+;
+
+// DEVICE MOVEMENT
+
+intToColor = FORMULA '(256*256*($1)+256*($2)+($3))::integer';
+rgb(INTEGER r, INTEGER g, INTEGER b) = COLOR(intToColor(r, g, b));
+
+value 'Значение измерения' = DATA LONG (Location);
+EXTEND FORM locations
+    PROPERTIES (l) value
+;
+
+location = GROUP AGGR Location l BY organization(l), value(l) MATERIALIZED;
+locationValue 'Знач. точки разм.' (Measurement m) = LONG(round0(value(m, locationType())));
+
+location (Measurement m) += location(organization(m), locationValue(m));
+
+dateFrom 'Время от' = DATA LOCAL ZDATETIME ();
+dateTo 'Время до' = DATA LOCAL ZDATETIME ();
+
+measurement = GROUP LAST Measurement m ORDER dateTime(m) 
+                            WHERE (NOT dateFrom() OR dateTime(m) >= dateFrom()) AND (NOT dateTo() OR dateTime(m) <= dateTo()) 
+                            BY device(m), latitude(m), longitude(m);
+
+FORM deviceMovement 'Перемещение датчиков'
+    OBJECTS gm=(m=Measurement, d=Device, la=DOUBLE, lt=DOUBLE) MAP
+    PROPERTIES dateFrom(), dateTo()
+    PROPERTIES dateTime(m), latitude 'Широта' = la AS DOUBLE, longitude 'Долгота' = lt AS DOUBLE, line 'Устройство' = id(d), color 'Цвет' = rgb(mod(id(d) * 371, 255), 255, 255), locationValue(m)  
+    ORDERS dateTime(m)
+    FILTERS m = measurement(d, la, lt)
+    
+    OBJECTS cmt = MeasurementType
+    FILTERS value(m,cmt)
+    PROPERTIES DRAW gm COLUMNS (cmt) PANEL displayValue(m, cmt) HEADER name(cmt) // , lastValue(d, cmt) HEADER name(cmt) + ' (raw)' SHOWIF hasDisplay(cmt)
+;
+
+// filters
+//INDEX organization(Measurement m), dateTime(m);
+
+EXTEND FORM deviceMovement
+    OBJECTS o = Organization PANEL BEFORE gm
+    
+    PROPERTIES (o) SHOWIF NOT organization(currentUser()) name SELECTOR
+    FILTERS o = organization(currentUser()) OR NOT organization(currentUser()) 
+    
+    FILTERS organization(d) = o
+;
+
+DESIGN deviceMovement {
+    OBJECTS {
+        NEW paramBox BEFORE BOX(gm) {
+            horizontal = TRUE;
+            MOVE BOX(o);
+            fill = 0;
+        }
+    }
+    GRID (gm) {
+        NEW dPanel {
+            MOVE PROPERTY(displayValue(m, cmt)) {
+                panelColumnVertical = TRUE;
+            }
+        }
+    }
+} 
+
+hasCoords (Device d) = (number(type(d), latitudeType()) AND number(type(d), longitudeType())) OR number(type(d), locationType()) MATERIALIZED;
+selected 'Выбр.' = DATA LOCAL BOOLEAN (Device) CHANGEKEY 'ADD' CHANGEMOUSE 'CTRL CLK';
+FORM selectDevices 'Выбор датчиков'
+    OBJECTS dv = Device
+    PROPERTIES (dv) selected, id, nameLocation, nameType READONLY
+    FILTERS hasCoords(dv)
+;
+selectedDevices 'Датчики' = GROUP CONCAT ''+id(Device d) IF selected(d),',' ORDER d;
+hasSelectedDevices = GROUP MAX selected(Device d) PREREAD;
+
+EXTEND FORM deviceMovement
+    EVENTS ON INIT {
+        dateFrom() <- currentZDateTime();
+        dateTo() <- currentZDateTime();            
+    }
+    PROPERTIES selectedDevices() ON CHANGE { DIALOG selectDevices FILTERS organization(dv) = o; }
+    FILTERS (NOT hasSelectedDevices() AND hasCoords(d)) OR selected(d)
+;
+
+DESIGN deviceMovement {
+    paramBox {
+        NEW filters {
+            horizontal = TRUE;
+            caption = 'Фильтры';
+            MOVE PROPERTY (selectedDevices());                
+            MOVE PROPERTY (dateFrom());                
+            MOVE PROPERTY (dateTo());                
+        } 
+    }
+}
+
+NAVIGATOR {
+    location {
+        NEW deviceMovement;
+    }
+}

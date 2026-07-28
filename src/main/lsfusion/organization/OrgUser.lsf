@@ -1,0 +1,122 @@
+MODULE OrgUser;
+
+REQUIRE Organization, Security, Location;
+
+NAMESPACE Organization;
+
+organization = DATA Organization (CustomUser);
+nameOrganization 'Организация' (CustomUser u) = name(organization(u)) CHARWIDTH 30;
+
+EXTEND FORM customUser
+    PROPERTIES(u) nameOrganization
+;
+
+EXTEND FORM customUsers
+    PROPERTIES(u) READONLY nameOrganization BEFORE login(u)
+;
+
+fillDefaultAccess(UserRole r) {
+    dataPermission(r, navigatorElementCanonicalName('System.root')) <- Permission.forbid;
+    defaultNumber(r, navigatorElementCanonicalName('Location.locations')) <- 1;
+    defaultNumber(r, navigatorElementCanonicalName('Device.devices')) <- 2;
+    defaultNumber(r, navigatorElementCanonicalName('Controller.controllers')) <- 3;
+    defaultNumber(r, navigatorElementCanonicalName('ControllerManagement.controllerManagers')) <- 4;
+}
+
+isOrg 'Роль организации' (UserRole r) = DATA BOOLEAN (UserRole);
+isOrg(CustomUser user) = GROUP MAX isOrg(UserRole ur) IF in(user, ur);
+CONSTRAINT (organization(CustomUser u) AND NOT isOrg(u)) OR (isOrg(u) AND NOT organization(u)) MESSAGE 'Для этой роли пользователя должна быть задана организация'; 
+
+copy(UserRole to, UserRole fr) + {
+    isOrg(to) <- isOrg(fr);
+}
+EXTEND FORM securityPolicy
+    PROPERTIES (ur) isOrg
+;
+
+onStarted() + {
+    IF NOT userRoleSID('orgadmin') THEN 
+        NEW r = UserRole {
+            sid(r) <- 'orgadmin';
+            name(r) <- 'Администратор организации';
+            isOrg(r) <- TRUE;
+            fillDefaultAccess(r);
+            defaultNumber(r, navigatorElementCanonicalName('Organization.organizationUsers')) <- 5;
+        }
+            
+    IF NOT userRoleSID('orguser') THEN 
+        NEW r = UserRole {
+            sid(r) <- 'orguser';
+            name(r) <- 'Пользователь организации';
+            isOrg(r) <- TRUE;
+            fillDefaultAccess(r);
+        }
+        
+    // временно для миграции
+    isOrg(userRoleSID('orgadmin')) <- TRUE;  
+    isOrg(userRoleSID('orguser')) <- TRUE;
+}
+
+META addOrganization(form, object)
+    EXTEND FORM form
+        OBJECTS o = Organization PANEL BEFORE object
+        PROPERTIES (o) SHOWIF NOT organization(currentUser()) name SELECTOR
+        FILTERS o = organization(currentUser()) OR NOT organization(currentUser()) 
+        
+        FILTERS organization(object) = o
+    ;
+    
+    DESIGN form {
+        top {
+            NEW paramBox FIRST {
+                horizontal = TRUE;
+                MOVE BOX(o);
+                fill = 0;
+            }
+        } 
+    } 
+END
+
+FORM dialogUserRoles
+    OBJECTS c = CustomUser PANEL
+    OBJECTS ur = UserRole
+    PROPERTIES name(ur), in(c, ur)
+;
+
+userRoles 'Роли' (CustomUser c) = GROUP CONCAT name(UserRole ur) IF in(c, ur), ',' ORDER ur;
+
+FORM organizationUsers 'Пользователи'
+    OBJECTS c = CustomUser
+    PROPERTIES (c) firstName, lastName, login, isLocked, sha256Password ON CHANGE changeSHA256Password(c), name, userRoles ON CHANGE {
+        DIALOG dialogUserRoles OBJECTS c = c;
+    }
+//    FILTERS isOrg(c)
+;
+DESIGN organizationUsers {
+    OBJECTS {
+        NEW split {
+            horizontal = FALSE;
+            NEW top {
+                MOVE BOX (c);
+                fill = 1;
+            }
+            NEW tab {
+                tabbed = TRUE;
+            }
+            fill = 1;
+        }
+    }
+} 
+
+@addOrganization(organizationUsers, c);
+
+EXTEND FORM organizationUsers
+    PROPERTIES 'Добавить' = { NEW u = CustomUser { in(u, userRoleSID('orguser')) <- TRUE; organization(u) <- o; } } DRAW c TOOLBAR
+    PROPERTIES (c) DELETE
+;
+
+NAVIGATOR {
+    data {
+        NEW organizationUsers AFTER organizations;
+    }
+}

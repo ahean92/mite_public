@@ -1,0 +1,105 @@
+{
+  "type": "timeseries",
+"options": {
+  "tooltip": {
+    "mode": "multi",
+    "sort": "none"
+  },
+  "legend": {
+    "showLegend": true,
+    "displayMode": "list",
+    "placement": "right",
+    "calcs": [
+      "last",
+      "min",
+      "max"
+    ]
+  }
+},
+"fieldConfig": {
+  "defaults": {
+    "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "barAlignment": 0,
+      "lineWidth": 2,
+      "fillOpacity": 10,
+      "gradientMode": "none",
+      "spanNulls": true,
+      "insertNulls": false,
+      "showPoints": "always",
+      "pointSize": 6,
+      "stacking": {
+        "mode": "none",
+        "group": "A"
+      },
+      "axisPlacement": "auto",
+      "axisLabel": "",
+      "axisColorMode": "text",
+      "axisBorderShow": false,
+      "scaleDistribution": {
+        "type": "linear"
+      },
+      "axisCenteredZero": false,
+      "hideFrom": {
+        "tooltip": false,
+        "viz": false,
+        "legend": false
+      },
+      "thresholdsStyle": {
+        "mode": "off"
+      },
+      "lineStyle": {
+        "fill": "dash",
+        "dash": [
+          10,
+          10
+        ]
+      }
+    },
+    "color": {
+      "mode": "continuous-YlBl"
+    },
+    "mappings": [],
+    "thresholds": {
+      "mode": "absolute",
+      "steps": [
+        {
+          "color": "green",
+          "value": null
+        },
+        {
+          "value": -10,
+          "color": "#E24D42"
+        },
+        {
+          "value": 0,
+          "color": "#EF843C"
+        },
+        {
+          "value": 10,
+          "color": "#6ED0E0"
+        },
+        {
+          "value": 20,
+          "color": "#EAB839"
+        },
+        {
+          "color": "red",
+          "value": 30
+        },
+        {
+          "value": 40,
+          "color": "#1F78C1"
+        }
+      ]
+    },
+    "unit": "short",
+    "decimals": 1
+  },
+  "overrides": []
+},
+"pluginVersion": "10.4.0",
+"timeFrom": null,
+"timeShift": null
+}

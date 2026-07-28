@@ -1,0 +1,514 @@
+MODULE MachineBot;
+
+// Бот «выезд/приезд» машин: отдельный модуль поверх Mite.
+// Mite задаёт точки расширения botRouteTimeFrom / botRouteEndDateTime для маршрутного отчёта.
+REQUIRE Mite, Telegram, Scheduler, Management, BackfillBot;
+
+// ===== Машина: номер =====
+machineNumber 'Код' = DATA STRING[20] (Location);            // код в сообщении водителя, напр. 4750
+machineByNumber = GROUP AGGR Location ml BY organization(ml), machineNumber(ml);   // уникальность кода в орг
+// Опознаём машину прямо по коду из сообщения (привязка чата к орг в этой базе ненадёжна)
+machineByCode (STRING code) = GROUP MAX Location ml IF machineNumber(ml) = code AND machine(ml);
+// Tg name — англ. название машины (под отдельного бота этой машины), напр. 'Peugeot 4750-7'
+botName 'Tg name' = DATA STRING[100] (Location);
+EXTEND FORM locations
+    PROPERTIES (l) botName
+;
+
+// ===== Бот машины: отправка от ИМЕНИ машины (свой бот-аккаунт на машину) =====
+// аккаунт-бот машины ищем по имени аккаунта = «Tg name» (или с суффиксом _bot, как в @username)
+machineBotAccount (Location ml) = GROUP MAX Messenger.Account a IF Messenger.name(a) = botName(ml) OR Messenger.name(a) = botName(ml) + '_bot';
+// машина по боту-получателю (водитель пишет в личку бота своей машины → код не нужен)
+machineByBotAccount (Messenger.Account a) = GROUP MAX Location ml IF machineBotAccount(ml) = a AND machine(ml);
+// машина по группе-получателю: название группы = «Tg name» машины (приём из одноимённой группы)
+machineByGroupChat (Messenger.Chat c) = GROUP MAX Location ml IF botName(ml) = Messenger.title(c) AND machine(ml);
+// ===== Лента Drivers — по «Отобр. имя» (showName) = 'Drivers_dominanta' (задаётся в форме «Чаты»).
+// showName вебхук НЕ затирает → переживает миграцию супергруппы (id/заголовок могут меняться). =====
+driversChat = GROUP MAX Messenger.Chat c IF ControllerManagement.showName(c) = 'Drivers_dominanta';
+driversChatId () = GROUP MAX Messenger.id(Messenger.Chat c) IF ControllerManagement.showName(c) = 'Drivers_dominanta';
+
+// ===== Рейс: выезд/приезд, ключ — дата ВЫЕЗДА =====
+botDeparture 'Выезд (бот)' = DATA TIME (Location, DATE);
+botArrival 'Приезд (бот)' = DATA TIME (Location, DATE);
+// DEPRECATED: заменено моделью «строка выезда / строка приезда» (приезд лежит в строке своего дня).
+// Оставлено объявленным без использования, чтобы деплой не ронял хранимую колонку миграцией.
+botArrivalDate 'Дата приезда (устар.)' = DATA DATE (Location, DATE);
+botDepartureReal 'Выезд от водителя' = DATA BOOLEAN (Location, DATE);
+botArrivalReal 'Приезд от водителя' = DATA BOOLEAN (Location, DATE);
+botDepartureMsgId = DATA LONG (Location, DATE);                // message_id авто-сообщения «выезд» (для удаления)
+botArrivalMsgId = DATA LONG (Location, DATE);
+
+// ===== НОВАЯ МОДЕЛЬ «строка выезда / строка приезда» =====
+// Приезд лежит в строке СВОЕГО дня. Пара к выезду дня dDep:
+//  - тот же день, если приезд стоит в строке выезда (однодневный рейс);
+//  - иначе ближайший ПОЗЖЕ день, где стоит приезд без своего выезда (многодневная командировка).
+// Рейсы последовательны (машина уезжает → возвращается), поэтому «ближайший приезд после выезда» = наш.
+nextArrivalDay (Location l, DATE dDep) = GROUP MIN DATE dA IF botArrival(l, dA) AND dA > dDep
+    AND botDeparture(l, dDep) AND NOT botArrival(l, dDep);
+// дата и время приезда рейса, начатого в день dDep (может быть на N суток позже выезда)
+tripArrivalDate (Location l, DATE dDep) = IF botArrival(l, dDep) THEN dDep ELSE nextArrivalDay(l, dDep);
+tripArrivalTime (Location l, DATE dDep) = botArrival(l, tripArrivalDate(l, dDep));
+// Момент приезда рейса, начатого в день dDep (полный datetime).
+botTripEnd (Location l, DATE dDep) = ZDATETIME(toDateTime(tripArrivalDate(l, dDep), tripArrivalTime(l, dDep)))
+    IF botDeparture(l, dDep) AND tripArrivalDate(l, dDep);
+// Рейс ИДЁТ сейчас: выехал и момент приезда ещё не наступил. Если приезда нет вовсе
+// (многодневная командировка, ждём реальный «Приехал») — страховка 5 суток от выезда (авто-закрытие).
+tripRunning (Location l, DATE d) = botDeparture(l, d)
+    AND currentZDateTimeSnapshot() < (OVERRIDE botTripEnd(l, d), ZDATETIME(toDateTime(sum(d, 5), 00:00)));
+
+// Открытый выезд — для привязки реального «Приехал» от водителя. Открыт, пока пары-приезда ещё нет.
+openDeparture (Location l, DATE d) = botDeparture(l, d) AND NOT tripArrivalDate(l, d) AND d <= currentDate();
+lastOpenDepartureDate (Location l) = GROUP MAX DATE d IF openDeparture(l, d);
+// Рейс с ПРОШЛОГО дня всё ещё идёт (настоящая многодневка) → новый рейс не открываем.
+lastRunningDepartureDate (Location l) = GROUP MAX DATE d IF tripRunning(l, d) AND d <= currentDate();
+onOpenTripBefore (Location ml, DATE d) = lastRunningDepartureDate(ml) < d;
+
+EXTEND FORM locations
+    PROPERTIES (l, ds) botDeparture, botArrival, botDepartureReal READONLY, botArrivalReal READONLY
+;
+
+// ===== Реализация точек расширения Mite =====
+// выезд, а в строке ДНЯ ПРИЕЗДА многодневного рейса (выезд пуст) — время приезда,
+// чтобы эта строка тоже появилась в маршрутном отчёте (фильтр формы = routeTimeFrom)
+botRouteTimeFrom(Location l, DATE d) += (OVERRIDE botDeparture(l, d), botArrival(l, d));
+// время приезда рейса, начатого в день d (в новой модели приезд лежит в строке СВОЕГО дня —
+// берём его через пару tripArrivalTime, чтобы отчёт на дне приезда показал время окончания)
+botRouteTimeTo(Location l, DATE d) += tripArrivalTime(l, d);
+// показывать в форме «Переопределения по датам» прошлые даты, где есть бот-данные (выезд/приезд)
+dateRowExtra(Location l, DATE d) += TRUE IF botDeparture(l, d) OR botArrival(l, d);
+// конец рейса как полный datetime (дата приезда + время), может быть на N дней позже выезда
+botRouteEndDateTime(Location l, DATE d) += botTripEnd(l, d);
+// рейс открыт, пока идёт → в отчёте приезд/мин-макс пустые (заполнятся при закрытии рейса, планом или реальным приездом)
+routeTripOpen(Location l, DATE d) += TRUE IF tripRunning(l, d);
+// дата выезда рейса, покрывающего день d: сам d, если в этот день выезд; иначе выезд более раннего
+// ОТКРЫТОГО рейса (выезд без приезда в тот же день), чей приезд приходится на день d или позже.
+routeTripStartDate(Location l, DATE d) += OVERRIDE
+    (d IF botDeparture(l, d)),
+    (GROUP MAX DATE d0 IF botDeparture(l, d0) AND NOT botArrival(l, d0) AND d0 < d
+        AND (OVERRIDE nextArrivalDay(l, d0), sum(d0, 5)) >= d);
+
+// ===== Механизм 1а: генерация (план ±20; приезд на след. сутки, если Окончание < Начало = 2-дневный рейс) =====
+// генерить в этот день? НЕТ, если официальный выходной/праздник (isDayOff) — КРОМЕ ручного
+// переопределения на дату (выбрано расписание dataScheduleFor или проставлено время dataTimeFrom).
+botGenDay (Location ml, DATE d) = (NOT isDayOff(d)) OR dataReportTimeFrom(ml, d);
+generateDepartures (Organization o, DATE d) {
+    LOCAL off = INTEGER ();
+    FOR Location ml IS Location AND organization(ml) = o AND machine(ml) AND reportTimeFrom(ml, d) AND reportTimeTo(ml, d) AND botGenDay(ml, d) AND NOT botDepartureReal(ml, d) AND NOT botDeparture(ml, d) AND NOT onOpenTripBefore(ml, d) DO {
+        off() <- round0((random() - 0.5) * 40);
+        botDeparture(ml, d) <- sumMinutes(reportTimeFrom(ml, d), off());
+    }
+}
+generateArrivals (Organization o, DATE d) {
+    LOCAL off = INTEGER ();
+    LOCAL arr = TIME ();
+    // гард NOT tripArrivalDate (а не NOT botArrival(ml,d)): приезд может лежать в строке СЛЕДУЮЩЕГО дня
+    // (рейс через полночь) — иначе генерация не видела бы его и перезаписывала джиттером каждый прогон.
+    FOR Location ml IS Location AND organization(ml) = o AND machine(ml) AND reportTimeFrom(ml, d) AND reportTimeTo(ml, d) AND botGenDay(ml, d) AND NOT botArrivalReal(ml, d) AND NOT tripArrivalDate(ml, d) AND NOT onOpenTripBefore(ml, d) DO {
+        off() <- round0((random() - 0.5) * 40);
+        arr() <- sumMinutes(reportTimeTo(ml, d), off());
+        // новая модель: если приезд раньше выезда — рейс перевалил за полночь → приезд в строку СЛЕДУЮЩИХ суток
+        // (без «Даты приезда»); иначе — в тот же день (однодневный рейс, выезд и приезд в одной строке).
+        IF arr() < (OVERRIDE botDeparture(ml, d), reportTimeFrom(ml, d)) THEN botArrival(ml, sum(d, 1)) <- arr();
+        ELSE botArrival(ml, d) <- arr();
+    }
+}
+generateMachineRoutes 'Сгенерировать выезды/приезды' (Organization o, DATE d) {
+    generateDepartures(o, d);
+    generateArrivals(o, d);
+}
+
+// ===== Механизм 3: контроль датчиков только в окне рейса =====
+// «в рейсе в момент at» = есть выезд d за последние ~5 суток и at в окне [выезд; приезд].
+// Окно берём ТОЛЬКО из полей бота (план от генерации, либо реальные времена, присланные водителем) —
+// НЕ из свойств отчёта: у них своя презентационная семантика (прочерки на открытом рейсе).
+// «Не контролировать» (notControlSchedule на дату) побеждает — тогда НЕ в рейсе.
+onTrip 'В рейсе' (Location l, ZDATETIME at) =
+    GROUP SUM 1 IF botDeparture(l, DATE d) AND machine(l)
+        AND NOT notControlSchedule(scheduleFor(l, d))
+        AND d <= DATE(at) AND d > sum(DATE(at), -5)
+        AND at >= ZDATETIME(toDateTime(d, botDeparture(l, d)))
+        AND at <= botTripEnd(l, d);
+
+// Подавлять уведомления управления на МАШИННОМ датчике, пока машина не в рейсе.
+// Стационарные датчики (не машина) — notActive NULL → работают как раньше.
+notActive(ControllerManagement.ControllerManager c) += TRUE IF
+    machine(location(ControllerManagement.templateDevice(c)))
+    AND NOT onTrip(location(ControllerManagement.templateDevice(c)), currentZDateTimeSnapshot());
+
+// ===== Telegram: своя отправка с захватом message_id + удаление =====
+// (платформенный sendMessageTelegram возвращает только ok/description, без message_id, а он нужен для удаления)
+GROUP machineSendResult EXTID 'result';
+botSentMsgId = DATA LOCAL LONG ();
+FORM machineSendResultForm
+    PROPERTIES () IN machineSendResult botSentMsgId EXTID 'message_id'
+;
+sendMachineMsg (Messenger.Chat chat, STRING txt) {
+    botSentMsgId() <- NULL;
+    LOCAL result = JSONFILE ();
+    TRY {
+        EXTERNAL HTTP GET 'https://api.telegram.org/bot' + Messenger.token(Messenger.account(chat)) + '/sendMessage?chat_id=' + Messenger.id(chat) + '&text=' + txt TO result;
+        IF NOT failedHttp() THEN IMPORT machineSendResultForm JSON FROM result();
+    }
+}
+deleteMachineMsg (Messenger.Chat chat, LONG msgId) {
+    LOCAL result = JSONFILE ();
+    IF msgId AND chat THEN
+        TRY { EXTERNAL HTTP GET 'https://api.telegram.org/bot' + Messenger.token(Messenger.account(chat)) + '/deleteMessage?chat_id=' + Messenger.id(chat) + '&message_id=' + msgId TO result; }
+}
+// отправка в общую ленту Drivers ТОКЕНОМ БОТА МАШИНЫ → в ленте подпись = имя машины
+sendToDrivers (Location ml, STRING txt) {
+    botSentMsgId() <- NULL;
+    LOCAL result = JSONFILE ();
+    LOCAL token = STRING(); token() <- Messenger.token(machineBotAccount(ml));
+    IF token() AND driversChatId() THEN TRY {
+        EXTERNAL HTTP GET 'https://api.telegram.org/bot' + token() + '/sendMessage?chat_id=' + driversChatId() + '&text=' + txt TO result;
+        IF NOT failedHttp() THEN {
+            IMPORT machineSendResultForm JSON FROM result();
+            // записать отправленное в историю чата (чтобы было видно в «Сообщения», подпись = имя машины)
+            IF botSentMsgId() THEN NEW msg = Messenger.Message {
+                Messenger.chat(msg) <- driversChat();
+                Messenger.message(msg) <- txt;
+                Messenger.from(msg) <- botName(ml);
+                Messenger.dateTime(msg) <- currentDateTime();
+            }
+        }
+    }
+}
+deleteFromDrivers (Location ml, LONG msgId) {
+    LOCAL result = JSONFILE ();
+    LOCAL token = STRING(); token() <- Messenger.token(machineBotAccount(ml));
+    IF msgId AND token() AND driversChatId() THEN
+        TRY { EXTERNAL HTTP GET 'https://api.telegram.org/bot' + token() + '/deleteMessage?chat_id=' + driversChatId() + '&message_id=' + msgId TO result; }
+}
+// reply-клавиатура [Выехал][Приехал] — нажатие шлёт обычный текст (callback не нужен).
+// JSON со СПЕЦСИМВОЛАМИ percent-кодирован ( { } [ ] " : , ), т.к. lsFusion ломает '{' в строке URL/тела;
+// кириллица сырая (Telegram её принимает). Telegram декодирует %xx → валидный reply_markup.
+botKeyboardMarkup () = '%7B%22keyboard%22%3A%5B%5B%22Выехал%22%2C%22Приехал%22%5D%5D%2C%22resize_keyboard%22%3Atrue%2C%22is_persistent%22%3Atrue%7D';
+// отправить клавиатуру в личку (chatId = id личного чата) токеном бота машины
+sendDmKeyboard (Location ml, STRING chatId) {
+    LOCAL result = JSONFILE ();
+    LOCAL token = STRING (); token() <- Messenger.token(machineBotAccount(ml));
+    IF token() AND chatId THEN
+        TRY { EXTERNAL HTTP POST 'https://api.telegram.org/bot' + token() + '/sendMessage'
+            BODYURL 'chat_id=' + chatId + '&text=Отметьте:&reply_markup=' + botKeyboardMarkup() TO result; }
+}
+
+// ===== Механизм 1б: диспетчер «от нас» — рассылка по ПЛАНОВОМУ времени =====
+// настало ли плановое время выезда / приезда (приезд — с учётом рейса через полночь по botArrivalDate)
+// «настало» = текущий момент в окне [план; план+90 мин] — чтобы не разослать устаревший план (напр. после перезапуска/деплоя)
+// «наступило» = текущий день и время плана уже пришло (приезд — по дате приезда, для рейса через полночь)
+departureDue (Location ml, DATE d) = botDeparture(ml, d) AND d = currentDate() AND TIME(currentDateTime()) >= botDeparture(ml, d);
+// приезд лежит в строке своего дня (новая модель) → dueм по самому дню d
+arrivalDue (Location ml, DATE d) = botArrival(ml, d) AND d = currentDate() AND TIME(currentDateTime()) >= botArrival(ml, d);
+
+// отправить выезд/приезд «от нас», если время плана настало и ещё не отправлено и не пришло от водителя
+sendDeparture (Location ml, DATE d) {
+    IF NOT botDepartureReal(ml, d) AND NOT botDepartureMsgId(ml, d) AND botGenDay(ml, d) AND departureDue(ml, d) THEN {
+        sendToDrivers(ml, 'Выехал');
+        botDepartureMsgId(ml, d) <- botSentMsgId();
+    }
+}
+sendArrival (Location ml, DATE d) {
+    IF NOT botArrivalReal(ml, d) AND NOT botArrivalMsgId(ml, d) AND botGenDay(ml, d) AND arrivalDue(ml, d) THEN {
+        sendToDrivers(ml, 'Приехал');
+        botArrivalMsgId(ml, d) <- botSentMsgId();
+    }
+}
+
+// ===== Задания планировщика =====
+// Организации автопарка берём ЧЕРЕЗ машины, а не по хардкоженому имени:
+// на проде орг называется 'ОДО "Доминантафарм"', поиск по 'ДоминантаФарм' давал NULL → бот ничего не находил.
+// ВСЕ орг, у которых есть машины (раньше botOrg() = GROUP MAX брал ПРОИЗВОЛЬНУЮ: пока машины были у одной орг
+// это работало, но со второй орг одна из них молча осталась бы вообще без генерации).
+botOrgMachines (Organization o) = GROUP SUM 1 IF machine(Location ml) AND organization(ml) = o;
+// 04:00 — сгенерировать ПЛАН (выезд+приезд) на день, без отправки
+botGeneratePlan 'Бот: сгенерировать план на день' (STRING[100] organizationName) {
+    FOR botOrgMachines(Organization o) DO generateMachineRoutes(o, currentDate());
+    APPLY;   // чтобы действие можно было вызвать и вручную (планировщик коммитит сам, повторный APPLY безвреден)
+}
+// каждую минуту — разослать наступившие по плану; приезд проверяем и по сегодняшнему, и по вчерашнему выезду (через полночь)
+botDispatchDue 'Бот: разослать наступившие по плану' (STRING[100] organizationName) {
+    // Страховка генерации: если задача в 04:00 не отработала (перезапуск/деплой/сбой),
+    // план на сегодня досоздаётся тут в течение 5 минут. Идемпотентно — где выезд уже есть, не трогает.
+    FOR botOrgMachines(Organization o) DO generateMachineRoutes(o, currentDate());
+    FOR Location ml IS Location AND machine(ml) DO {
+        sendDeparture(ml, currentDate());
+        sendArrival(ml, currentDate());
+        sendArrival(ml, sum(currentDate(), -1));
+    }
+}
+// ~11:00 (выезды) и вечер (приезды) — убрать лишние авто-сообщения бота там, где водитель отчитался сам
+botCleanupDepartures 'Бот: убрать лишние авто-выезды' (STRING[100] organizationName) {
+    FOR Location ml IS Location AND machine(ml) AND NOT machineBotAccount(ml) AND botDepartureReal(ml, currentDate()) AND botDepartureMsgId(ml, currentDate()) DO {
+        deleteMachineMsg(driversChat(), botDepartureMsgId(ml, currentDate()));
+        botDepartureMsgId(ml, currentDate()) <- NULL;
+    }
+}
+botCleanupArrivals 'Бот: убрать лишние авто-приезды' (STRING[100] organizationName) {
+    FOR Location ml IS Location AND machine(ml) AND NOT machineBotAccount(ml) AND botArrivalReal(ml, currentDate()) AND botArrivalMsgId(ml, currentDate()) DO {
+        deleteMachineMsg(driversChat(), botArrivalMsgId(ml, currentDate()));
+        botArrivalMsgId(ml, currentDate()) <- NULL;
+    }
+}
+
+// ===== Механизм 2: приём сообщений водителей =====
+processedMachineMsg 'Обработано (бот машин)' = DATA BOOLEAN (Messenger.Message);
+cleanMachineMsg (Messenger.Message m) = replace(replace(replace(trim(message(m)), '-', ''), ' ', ''), '_', '');
+// действие: «1» или «выехал» → выезд; «2» или «приехал» → приезд (reply-кнопки шлют текст «Выехал»/«Приехал»)
+msgLower (Messenger.Message m) = lower(trim(message(m)));
+msgHas (Messenger.Message m, STRING sub) = length(msgLower(m)) > length(replace(msgLower(m), sub, ''));
+machineMsgAction (Messenger.Message m) =
+    IF (msgHas(m, 'выехал') OR right(cleanMachineMsg(m), 1) == '1') THEN '1'
+    ELSE (IF (msgHas(m, 'приехал') OR right(cleanMachineMsg(m), 1) == '2') THEN '2');
+machineMsgNumber (Messenger.Message m) = left(cleanMachineMsg(m), length(cleanMachineMsg(m)) - 1) IF machineMsgAction(m);
+// машина — по боту-получателю ТОЛЬКО в личке (водитель пишет в личку бота своей машины),
+// иначе (в группе бот тоже всё видит) — по коду в тексте.
+// ТОЛЬКО личка боту машины: машина = тот бот, кому написали (приватность на личку не влияет, код не нужен).
+incomingMachine (Messenger.Message m) = machineByBotAccount(Messenger.account(Messenger.chat(m))) IF Messenger.chatType(Messenger.chat(m)) = Messenger.ChatType.private;
+
+// зафиксировать реальный выезд (+ удалить авто-сообщение «выезд»)
+recordRealDeparture (Location ml, DATETIME at) {
+    IF NOT botDepartureReal(ml, DATE(at)) THEN {
+    botDeparture(ml, DATE(at)) <- TIME(at);
+    botDepartureReal(ml, DATE(at)) <- TRUE;
+    IF machineBotAccount(ml) THEN {
+        // машина со своим ботом: убрать имитацию и выложить реальный отчёт её же ботом
+        IF botDepartureMsgId(ml, DATE(at)) THEN deleteFromDrivers(ml, botDepartureMsgId(ml, DATE(at)));
+        sendToDrivers(ml, 'Выехал');
+        botDepartureMsgId(ml, DATE(at)) <- botSentMsgId();
+    } ELSE IF botDepartureMsgId(ml, DATE(at)) THEN {
+        deleteMachineMsg(driversChat(), botDepartureMsgId(ml, DATE(at)));
+        botDepartureMsgId(ml, DATE(at)) <- NULL;
+    }
+    }
+}
+// зафиксировать реальный приезд на дату открытого выезда (+ удалить авто-сообщение «приезд»)
+recordRealArrival (Location ml, DATETIME at) {
+    LOCAL dep = DATE ();
+    dep() <- lastOpenDepartureDate(ml);
+    // новая модель: приезд пишем в строку ДНЯ, когда водитель отчитался (DATE(at)).
+    // Если это день выезда — однодневный (одна строка); если позже — многодневный (пара выезд↔приезд).
+    IF dep() AND NOT botArrival(ml, DATE(at)) THEN {
+        botArrival(ml, DATE(at)) <- TIME(at);
+        botArrivalReal(ml, DATE(at)) <- TRUE;
+        IF machineBotAccount(ml) THEN {
+            IF botArrivalMsgId(ml, DATE(at)) THEN deleteFromDrivers(ml, botArrivalMsgId(ml, DATE(at)));
+            sendToDrivers(ml, 'Приехал');
+            botArrivalMsgId(ml, DATE(at)) <- botSentMsgId();
+        } ELSE IF botArrivalMsgId(ml, DATE(at)) THEN {
+            deleteMachineMsg(driversChat(), botArrivalMsgId(ml, DATE(at)));
+            botArrivalMsgId(ml, DATE(at)) <- NULL;
+        }
+    }
+}
+
+processMachineMsg (Messenger.Message m) {
+    IF Messenger.from(m) != 'YOU' AND NOT processedMachineMsg(m) AND incomingMachine(m) THEN {
+        IF machineMsgAction(m) == '1' THEN recordRealDeparture(incomingMachine(m), Messenger.dateTime(m));
+        ELSE IF machineMsgAction(m) == '2' THEN recordRealArrival(incomingMachine(m), Messenger.dateTime(m));
+        // не действие (напр. /start, «привет») → показать кнопки в этой личке
+        ELSE sendDmKeyboard(incomingMachine(m), Messenger.id(Messenger.chat(m)));
+        processedMachineMsg(m) <- TRUE;
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO processMachineMsg(m);
+
+// ===== Механизм 4: «кривой рейс» — переспросить экспедитора (канал/белый список BackfillBot) =====
+// Многодневный рейс задаётся ПУСТЫМ приездом (ждём реальный «Приехал», страховка 5 суток — см. tripRunning).
+// «Кривой» = ОБА времени проставлены в ОДИН рейс, но приезд НЕ ПОЗЖЕ выезда или рейс < часа
+// (напр. выезд 14:00, приезд 13:00 того же дня — экспедитор ошибся, или это через-полночь): переспрашиваем.
+// Длина рейса в секундах (учёт даты приезда для рейсов через сутки) < 3600 → кривой; отрицательная/нулевая тоже.
+crookedTrip (Location l, DATE d) = machine(l) AND botDeparture(l, d) AND botArrival(l, d)
+    AND (getSeconds(botTripEnd(l, d)) - getSeconds(ZDATETIME(toDateTime(d, botDeparture(l, d))))) < 3600;
+
+// Состояние вопроса per (машина, дата выезда)
+tripAsked 'Спрошен (кривой рейс)' = DATA BOOLEAN (Location, DATE);
+tripResolved 'Уточнён' = DATA BOOLEAN (Location, DATE);
+tripResolution 'Решение экспедитора' = DATA STRING[10] (Location, DATE);   // multiday | ok | error
+tripAskedAt = DATA ZDATETIME (Location, DATE);
+tripAnsweredBy 'Кто ответил' = DATA STRING[80] (Location, DATE);
+
+hhmm (TIME t) = left(r'' + t, 5);   // 'HH:MM' из TIME (r'' + TIME → 'HH:MM:SS')
+anyTripAsk () = GROUP SUM 1 IF tripAsked(Location l, DATE d) AND NOT tripResolved(l, d);   // есть открытый вопрос
+// последняя открытая дата вопроса по машине — к ней привязываем ответ
+tripOpenDate (Location l) = GROUP MAX DATE d IF tripAsked(l, d) AND NOT tripResolved(l, d);
+
+// -------- Спросить по одному кривому рейсу (без APPLY → годится и для события, и для сводной проверки) --------
+// bfSend сам рассылает КАЖДОМУ из белого списка в его личку с ботом (см. BackfillBot) — свой рассыльщик не нужен.
+askCrooked (Location l, DATE d) {
+    tripAsked(l, d) <- TRUE;
+    tripAskedAt(l, d) <- currentZDateTime();
+    bfSend('Странный рейс: ' + (OVERRIDE machineNumber(l), botName(l)) + ' ' + toDateDDMMYYYY(d)
+         + ' — выезд ' + hhmm(botDeparture(l, d)) + ', приезд ' + hhmm(botArrival(l, d))
+         + ' (приезд не позже выезда или рейс меньше часа). Ответьте КОД машины и цифру: 1 — многодневный рейс (жду реальный приезд), 2 — время верное, 3 — ошибка ввода (обнулить рейс). Пример: '
+         + (OVERRIDE machineNumber(l), '4750') + ' 1', '');
+}
+// СОБЫТИЕ: рейс стал «кривым» при изменении времён (реальный приезд от водителя, правка в форме, генерация) →
+// сразу спрашиваем. Никакого опроса по таймеру — реагируем ровно на изменение данных.
+// Гард crookedTrip + NOT tripAsked → шлём только по реально кривому и один раз; на нормальных/массовых
+// изменениях (обычная генерация, обнуление приезда) crookedTrip=ложь → ничего не шлём.
+WHEN (CHANGED(botArrival(Location l, DATE d)) OR CHANGED(botDeparture(l, d)))
+    AND machine(l) AND crookedTrip(l, d) AND NOT tripAsked(l, d)
+    AND d <= currentDate() AND d > sum(currentDate(), -5)
+    DO askCrooked(l, d);
+// Ручная/резервная сводная проверка (не в планировщике): пройтись по всем ещё не спрошенным кривым.
+tripClarifyCheck 'Кривые рейсы: спросить экспедитора' () {
+    FOR crookedTrip(Location l, DATE d) AND NOT tripAsked(l, d) AND d <= currentDate() AND d > sum(currentDate(), -5) DO
+        askCrooked(l, d);
+    APPLY;
+}
+
+// -------- Ответ экспедитора (вебхук; APPLY/тяжёлое НЕЛЬЗЯ — только смена данных + подтверждение) --------
+processedTripMsg 'Обработано (кривой рейс)' = DATA BOOLEAN (Messenger.Message);
+// ответчик из BackfillBot не должен слать «не понял» на ответы про рейсы — сообщаем ему, что разобрали сами
+handledElsewhere (Messenger.Message m) += processedTripMsg(m);
+tripMsgLo (Messenger.Message m) = lower(trim(Messenger.message(m)));
+// сегмент после упоминания кода машины; если открыт ровно один вопрос и код не назван — всё сообщение
+// ★ГОЧА (27.07.2026): раньше ответом считалось ЛЮБОЕ сообщение с цифрой 1/2/3 — и фраза «снизить
+// на 1-2 %» в письме про графики закрыла вопрос как «многодневный рейс». Теперь целиком сообщение
+// принимается за ответ только если оно КОРОТКОЕ («1», «4750 2»); длинный текст обязан содержать код машины.
+tripSeg (Messenger.Message m, Location l) = OVERRIDE
+    (suffixFrom(tripMsgLo(m), posOf(tripMsgLo(m), lower(machineNumber(l))) + length(machineNumber(l))) IF posOf(tripMsgLo(m), lower(machineNumber(l))) > 0),
+    (tripMsgLo(m) IF anyTripAsk() = 1 AND length(tripMsgLo(m)) <= 12);
+// первая отдельно стоящая цифра 1/2/3 в сегменте (не часть большего числа) — выбор экспедитора.
+// Регэксп передаём ПАРАМЕТРОМ (как firstNum в BackfillBot): вложенные кавычки в FORMULA-строке lsFusion не парсит.
+firstChoice (STRING s, STRING re) = FORMULA STRING '(regexp_match($1, $2))[2]';
+// ★ГОЧА: без совпадения FORMULA отдаёт ПУСТУЮ СТРОКУ, а не NULL — для lsFusion это «значение есть»,
+// поэтому любое сообщение (напр. «Да») проходило как ответ и молча закрывало вопрос. Пустое → NULL.
+tripChoiceRaw (Messenger.Message m, Location l) = firstChoice(tripSeg(m, l), '(^|[^0-9])([123])([^0-9]|$)');
+tripChoice (Messenger.Message m, Location l) = tripChoiceRaw(m, l) IF length(tripChoiceRaw(m, l)) > 0;
+
+resolveTrip (Location l, DATE d, STRING choice, Messenger.Message m) {
+    IF choice = '1' THEN {   // многодневный: обнулить приезд в строке выезда → рейс «в пути», ждём реальный «Приехал» в строке дня возврата (страховка 5 суток)
+        tripResolution(l, d) <- 'multiday';
+        botArrival(l, d) <- NULL; botArrivalReal(l, d) <- NULL;
+    }
+    ELSE IF choice = '2' THEN tripResolution(l, d) <- 'ok';   // время верное — оставить как есть
+    ELSE IF choice = '3' THEN {   // ошибка ввода: обнулить рейс целиком (экспедитор введёт заново)
+        tripResolution(l, d) <- 'error';
+        botDeparture(l, d) <- NULL; botDepartureReal(l, d) <- NULL;
+        botArrival(l, d) <- NULL; botArrivalReal(l, d) <- NULL;
+    }
+    // Вопрос закрываем ТОЛЬКО если решение реально записано — иначе нераспознанный ответ
+    // молча пометил бы вопрос отвеченным и потерял его (см. гочу с пустой строкой выше).
+    IF tripResolution(l, d) THEN {
+        tripResolved(l, d) <- TRUE;
+        tripAnsweredBy(l, d) <- Messenger.from(m);
+        // Итог рассылаем ВСЕМ из белого списка: вопрос видели все, значит и ответ должны видеть все —
+        // иначе у остальных вопрос висит «без ответа» (Mia не видела, что ответил draftKL).
+        bfSend('Рейс ' + (OVERRIDE machineNumber(l), botName(l), name(l)) + ' ' + toDateDDMMYYYY(d) + ': '
+             + Messenger.from(m) + ' ответил(а) — '
+             + (IF tripResolution(l, d) = 'multiday' THEN 'многодневный рейс, жду реальный приезд'
+                ELSE (IF tripResolution(l, d) = 'ok' THEN 'время верное, оставляю как есть'
+                ELSE 'ошибка ввода, рейс обнулён')), '');
+    }
+}
+processTripMsg (Messenger.Message m) {
+    // фильтр: наш бот (аккаунт DomFarm) + отправитель в белом списке + есть открытый вопрос.
+    // НЕ матчим по конкретному chat_id — иначе слышим только один чат; пускаем ЛЮБОГО из белого списка
+    // из его личного чата с нашим ботом (аккаунт-гард отсекает чужих ботов/водителей).
+    IF Messenger.from(m) != 'YOU' AND NOT processedTripMsg(m) AND anyTripAsk()
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m)) THEN {
+        LOCAL done = INTEGER (); done() <- 0;
+        FOR Location l IS Location AND tripOpenDate(l) AND tripChoice(m, l) DO {
+            resolveTrip(l, tripOpenDate(l), tripChoice(m, l), m);
+            done() <- done() + 1;
+        }
+        // итог по каждому рейсу рассылает resolveTrip (всем из белого списка) — отдельное подтверждение не нужно
+        IF done() > 0 THEN processedTripMsg(m) <- TRUE;
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO processTripMsg(m);
+
+// ===== Универсальная квитанция: бот НЕ молчит ни на одно сообщение из белого списка =====
+// На любое сообщение — «✓ Принял: «текст»». Если не распознал команду — подсказывает, что умеет.
+// Спец-хендлеры (да/нет, проверь, ок/переделать, ответ по рейсу) добавляют детали сверх квитанции.
+// Лежит в MachineBot (видит и дозаполнение через BackfillBot, и рейсы) → знает все команды бота.
+botAckDone 'Квитанция отправлена' = DATA BOOLEAN (Messenger.Message);
+botMsgKnown (Messenger.Message m) = msgHas(m, 'да') OR msgHas(m, 'нет') OR msgHas(m, 'ок')
+    OR msgHas(m, 'передела') OR msgHas(m, 'провер') OR msgHas(m, 'что с') OR msgHas(m, 'статус')
+    OR hasDigit(bfLower(m), '[0-9]') > 0;
+botAck (Messenger.Message m) {
+    IF Messenger.from(m) != 'YOU' AND NOT botAckDone(m)
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m)) THEN {
+        bfSendOne(STRING(Messenger.id(Messenger.chat(m))),
+            '✓ Принял: «' + left(Messenger.message(m), 100) + '»'
+            + (IF NOT botMsgKnown(m) THEN '. Не распознал команду. Умею: «да/нет» по датчикам при открытом вопросе, «проверь <номер>», «проверь всё за сутки», «ок/переделать» при проверке рейса/дозаполнения.' ELSE ''));
+        botAckDone(m) <- TRUE;
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO botAck(m);
+
+// ===== Параметрless-обёртки для планировщика (привязка по каноническому имени — надёжнее script) =====
+botGeneratePlanDominanta 'Бот: план (ДоминантаФарм)' () { botGeneratePlan('ДоминантаФарм'); }
+botDispatchDueDominanta 'Бот: рассылка (ДоминантаФарм)' () { botDispatchDue('ДоминантаФарм'); }
+botCleanupDeparturesDominanta 'Бот: уборка выездов (ДоминантаФарм)' () { botCleanupDepartures('ДоминантаФарм'); }
+botCleanupArrivalsDominanta 'Бот: уборка приездов (ДоминантаФарм)' () { botCleanupArrivals('ДоминантаФарм'); }
+
+// Пересоздать задания (напр. после ручного удаления) = перезапуск сервера: при старте создаются заново с привязкой действия.
+// ===== Регистрация заданий планировщика (создаём только если ещё нет — без delete-пересоздания, чтобы не «протухала» ссылка у планировщика) =====
+botSetupSchedule () {
+    // 04:00 — сгенерировать план (выезд+приезд) на день
+    IF NOT scheduledTask('Бот: план маршрутов (ДоминантаФарм)') THEN {
+        createScheduledTask('Бот: план маршрутов (ДоминантаФарм)', dateTimeToDateTime(currentDate(), 04:00), 86400, SchedulerStartType.afterStart);
+        createScheduledTaskDetail('Бот: план маршрутов (ДоминантаФарм)', 1, 'MachineBot.botGeneratePlanDominanta[]');
+    }
+    // каждую минуту — разослать наступившие по плану
+    IF NOT scheduledTask('Бот: рассылка по плану (ДоминантаФарм)') THEN {
+        createScheduledTask('Бот: рассылка по плану (ДоминантаФарм)', dateTimeToDateTime(currentDate(), 00:00), 300, SchedulerStartType.afterStart);   // раз в 5 минут — для «от нас» точности хватает, лог не пухнет
+        createScheduledTaskDetail('Бот: рассылка по плану (ДоминантаФарм)', 1, 'MachineBot.botDispatchDueDominanta[]');
+    }
+    // ~11:00 — убрать лишние авто-выезды (где водитель отчитался сам)
+    IF NOT scheduledTask('Бот: уборка выездов (ДоминантаФарм)') THEN {
+        createScheduledTask('Бот: уборка выездов (ДоминантаФарм)', dateTimeToDateTime(currentDate(), 11:00), 86400, SchedulerStartType.afterStart);
+        createScheduledTaskDetail('Бот: уборка выездов (ДоминантаФарм)', 1, 'MachineBot.botCleanupDeparturesDominanta[]');
+    }
+    // 23:00 — убрать лишние авто-приезды
+    IF NOT scheduledTask('Бот: уборка приездов (ДоминантаФарм)') THEN {
+        createScheduledTask('Бот: уборка приездов (ДоминантаФарм)', dateTimeToDateTime(currentDate(), 23:00), 86400, SchedulerStartType.afterStart);
+        createScheduledTaskDetail('Бот: уборка приездов (ДоминантаФарм)', 1, 'MachineBot.botCleanupArrivalsDominanta[]');
+    }
+    // (кривые рейсы теперь ловим СОБЫТИЕМ по изменению времён — WHEN ниже, без задания планировщика)
+    // после перезапуска/деплоя не рассылать УЖЕ ПРОШЕДШИЙ неотправленный план (устаревший); будущий план дня — оставить
+    FOR Location ml IS Location AND machine(ml) AND NOT botDepartureReal(ml, currentDate()) AND NOT botDepartureMsgId(ml, currentDate()) AND TIME(currentDateTime()) > botDeparture(ml, currentDate()) DO
+        botDeparture(ml, currentDate()) <- NULL;
+    FOR Location ml IS Location AND machine(ml) AND NOT botArrivalReal(ml, currentDate()) AND NOT botArrivalMsgId(ml, currentDate()) AND currentDateTime() > toDateTime(currentDate(), botArrival(ml, currentDate())) DO
+        botArrival(ml, currentDate()) <- NULL;
+    APPLY;
+}
+onStarted() + { botSetupSchedule(); }
+
+// Разовый пересчёт материализации active после появления гейта notActive:
+// смена формулы материализованного свойства НЕ пересчитывает хранимую колонку сама — нужен RECALCULATE
+// (иначе гейт «вне рейса не уведомлять» не виден до ручного пересчёта). Флаг → выполняется один раз.
+recalcedActiveTrip = DATA BOOLEAN ();
+onStarted() + {
+    IF NOT recalcedActiveTrip() THEN {
+        RECALCULATE ControllerManagement.active(ControllerManagement.ControllerManager c);
+        recalcedActiveTrip() <- TRUE;
+        APPLY;
+    }
+}
+// Ещё один разовый пересчёт: окно onTrip переехало с routeEndDateTime на botTripEnd,
+// значения notActive изменились → хранимую колонку active надо пересчитать заново.
+recalcedActiveTripEnd = DATA BOOLEAN ();
+onStarted() + {
+    IF NOT recalcedActiveTripEnd() THEN {
+        RECALCULATE ControllerManagement.active(ControllerManagement.ControllerManager c);
+        recalcedActiveTripEnd() <- TRUE;
+        APPLY;
+    }
+}
+// Разово убрать ранее созданное 5-минутное задание «Кривые рейсы: проверка» — теперь спрашиваем по СОБЫТИЮ (WHEN), не по таймеру.
+tripAskTimerRemoved = DATA BOOLEAN ();
+onStarted() + {
+    IF NOT tripAskTimerRemoved() THEN {
+        FOR scheduledTask(ScheduledTaskDetail dt) = scheduledTask('Кривые рейсы: проверка') DO DELETE dt;
+        FOR ScheduledTask st = scheduledTask('Кривые рейсы: проверка') DO DELETE st;
+        tripAskTimerRemoved() <- TRUE;
+        APPLY;
+    }
+}
+

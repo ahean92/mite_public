@@ -1,0 +1,694 @@
+MODULE BackfillBot;
+
+// Бот-дозаполнение пропусков датчиков: ежедневная проверка → спросить в ТГ (Drivers_dominanta) →
+// по «Да» сгенерить задним числом по паттерну прошлых недель (тот же день недели + isDayOff) → показать «проверь» → крутить до «Ок».
+REQUIRE Mite, Telegram, Scheduler, Management;
+
+// ================= Датчик: интервал, последняя точка, дыра =================
+// последняя точка датчика (в Unix-секундах)
+lastMeasureSec (Device d) = getSeconds((GROUP MAX dateTime(Measurement m) IF device(m) = d));
+
+// порог «дыры»: нет данных за последние сутки (последняя точка старше 24 ч)
+gapThresholdSec () = 86400;
+nowSec () = getSeconds(currentZDateTime());
+hasGap (Device d) = lastMeasureSec(d) AND (nowSec() - lastMeasureSec(d)) > gapThresholdSec();
+
+// «прошлый день» = вчерашние календарные сутки [вчера 00:00, сегодня 00:00).
+// Проверка 12:00 смотрит ТОЛЬКО их: если за вчера у датчика нет ни одной точки — это дыра за прошлый день.
+prevDayFrom () = toZDateTime(sum(currentDate(), -1));  // вчера 00:00 как ZDATETIME (зона сервера)
+prevDayTo   () = toZDateTime(currentDate());            // сегодня 00:00 как ZDATETIME
+prevDayStart () = getSeconds(prevDayFrom());  // то же в epoch-сек — для окна заявки (fromSec/toSec)
+prevDayEnd   () = getSeconds(prevDayTo());
+// Сравнение ПРЯМО по dateTime (ZDATETIME) использует индекс по времени и не сканит всю таблицу измерений
+// (getSeconds(dateTime(m)) — функция поверх колонки — индекс блокирует и заставляет полный проход).
+prevDayCount (Device d) = GROUP SUM 1 IF device(Measurement m) = d
+    AND dateTime(m) >= prevDayFrom() AND dateTime(m) < prevDayTo();
+// дыра за прошлый день: датчик когда-то писал (реальный), но за вчера — ноль точек
+noPrevDayData (Device d) = lastMeasureSec(d) AND (OVERRIDE prevDayCount(d), 0) = 0;
+
+// Режим. По умолчанию (NULL) — БЕЗОПАСНЫЙ тест: скоуп только mite_eco + БЕЗ реальной записи (бот шлёт/отвечает, данные не трогает).
+// bfLive() <- TRUE включает боевой режим (все датчики + реальная генерация). Ставится флагом через eval.
+bfLive = DATA BOOLEAN ();
+// eco-датчики для тест-режима: тип устройства = MITE_ECO_2 И есть simID (реально передающие; без SIM — старые/списанные записи Device)
+ecoDevice (Device d) = lower(name(type(d))) = 'mite_eco_2' AND simID(d);
+// Точка размещения НА ПОВЕРКЕ: бот её датчики НЕ проверяет (не заводит вопрос о дыре) и НЕ трогает (не заполняет).
+underVerification 'На поверке' = DATA BOOLEAN (Location);
+EXTEND FORM locations PROPERTIES (l) underVerification;
+// датчик исключён из бота, если его точка размещения на поверке
+deviceUnderVerification (Device d) = underVerification(location(d));
+
+// ================= Заявка =================
+CLASS BackfillRequest 'Заявка дозаполнения';
+device = DATA Device (BackfillRequest);
+nameDevice (BackfillRequest r) = STRING(id(device(r)));
+fromSec = DATA LONG (BackfillRequest);
+toSec = DATA LONG (BackfillRequest);
+// стадия: asked | approved | generated | checking | done | rejected
+stage 'Стадия' = DATA STRING[15] (BackfillRequest);
+created = DATA ZDATETIME (BackfillRequest);
+comment 'Комментарий' = DATA TEXT (BackfillRequest);
+msgId = DATA LONG (BackfillRequest);
+weeksBack 'Недель усредн.' = DATA INTEGER (BackfillRequest);   // сколько недель назад усреднять (NULL → 4)
+answeredBy 'Кто ответил' = DATA STRING[80] (BackfillRequest);
+answeredMsg = DATA Messenger.Message (BackfillRequest);   // каким сообщением закрыта — для сводки «по текущему ответу»
+answerText 'Ответ' = DATA STRING[200] (BackfillRequest);
+answeredAt 'Когда ответили' = DATA ZDATETIME (BackfillRequest);
+genAt 'Когда дозаполнено' = DATA ZDATETIME (BackfillRequest);
+genCount 'Точек дозаполнено' = DATA INTEGER (BackfillRequest);
+liveAtGen 'Боевой режим' = DATA BOOLEAN (BackfillRequest);
+
+// читаемые/вычисляемые поля лога
+reqFromDT 'Период с' (BackfillRequest r) = toZDateTime(fromSec(r));
+reqToDT 'Период по' (BackfillRequest r) = toZDateTime(toSec(r));
+reqDays 'Дней' (BackfillRequest r) = NUMERIC[10,1]((toSec(r) - fromSec(r)) / 86400.0);
+
+// Границы окна заявки ДЛЯ ВЫБОРКИ (не для показа — для показа выше reqFromDT/reqToDT).
+// Сравнивать надо прямо по dateTime, иначе getSeconds() поверх колонки блокирует индекс. Но getSeconds()
+// отбрасывает дробную часть секунды, поэтому прямой перенос границ сместил бы их: в данных ~96% точек
+// имеют ненулевые миллисекунды. Точный эквивалент прежней посекундной семантики — полуоткрытый интервал:
+//   getSeconds(dt) >  L  ==  dt >= L+1сек        getSeconds(dt) <= U  ==  dt <  U+1сек
+//   getSeconds(dt) >= L  ==  dt >= L             getSeconds(dt) <  U  ==  dt <  U
+// Он так же индексируется.
+selFrom (BackfillRequest r) = toZDateTime(fromSec(r) + 1);   // прежнее строгое > fromSec
+selTo   (BackfillRequest r) = toZDateTime(toSec(r) + 1);     // прежнее <= toSec
+selToEx (BackfillRequest r) = toZDateTime(toSec(r));         // прежнее строгое < toSec (ветка redo)
+
+reqGenCount 'Точек в периоде' (BackfillRequest r) = GROUP SUM 1 IF device(Measurement m) = device(r) AND dateTime(m) >= selFrom(r) AND dateTime(m) < selTo(r);
+reqOrg 'Организация' (BackfillRequest r) = name(organization(device(r)));
+reqHasMetric (BackfillRequest r, MeasurementType t) = GROUP SUM 1 IF device(Measurement m, t) = device(r) AND dateTime(m, t) >= selFrom(r) AND dateTime(m, t) < selTo(r);
+reqMetrics 'Метрики' (BackfillRequest r) = GROUP CONCAT name(MeasurementType t), ', ' ORDER t IF reqHasMetric(r, t) > 0;
+reqMode 'Режим' (BackfillRequest r) = IF liveAtGen(r) THEN 'боевой' ELSE (IF genAt(r) THEN 'тест' ELSE '');
+
+FORM backfillRequests 'Дозаполнение — лог'
+    OBJECTS r = BackfillRequest
+    PROPERTIES (r) READONLY nameDevice, reqOrg, stage, reqFromDT, reqToDT, reqDays, weeksBack, reqMetrics, genCount, reqMode, answeredBy, answerText, answeredAt, created, genAt, comment
+;
+// (не в навигаторе — dev-форма, чтобы не засорять меню)
+
+// ================= Белый список: кто может командовать ботом =================
+CLASS BfSender 'Отправитель (белый список)';
+whFrom 'Messenger from (id/username)' = DATA STRING[80] (BfSender) IN id;
+whNote 'Комментарий' = DATA STRING[100] (BfSender);
+// разрешён ли отправитель f (есть запись в белом списке)
+// match regardless of a leading '@' on either the stored entry or the incoming sender
+bfAllowed (STRING f) = GROUP MAX BfSender s IF f AND (whFrom(s) = f OR ('@' + whFrom(s)) = f OR whFrom(s) = ('@' + f));
+// форма белого списка (не в навигаторе, чтобы не засорять меню; веду через eval)
+FORM bfSenders 'Белый список бота'
+    OBJECTS s = BfSender
+    PROPERTIES (s) whFrom, whNote, NEW, DELETE
+;
+
+// самая свежая незакрытая заявка датчика (для привязки ответа из бота)
+openRequest (Device d) = GROUP LAST BackfillRequest r ORDER created(r), r
+    IF device(r) = d AND (stage(r) = 'asked' OR stage(r) = 'checking');
+anyOpenRequest () = GROUP LAST BackfillRequest r ORDER created(r), r
+    IF stage(r) = 'asked' OR stage(r) = 'checking';
+
+// ---- SQL-строковые хелперы (нужны и обучению, и разбору ответа) ----
+posOf (STRING s, STRING sub) = FORMULA INTEGER 'strpos($1, $2)';        // 1-based, 0 если нет
+suffixFrom (STRING s, INTEGER p) = FORMULA STRING 'substr($1, $2)';     // от p до конца
+hasDigit (STRING s, STRING pat) = FORMULA INTEGER 'CASE WHEN $1 ~ $2 THEN 1 ELSE 0 END';   // regex-совпадение 1/0
+
+// ================= Обучение: предпочтения per-датчик (копятся из фидбэка) =================
+prefNoDecimals 'Без сотых' = DATA BOOLEAN (Device, MeasurementType);   // округлять до целых (пер-метрике: «батарею целым» не трогает темп)
+prefSmooth 'Плавно (мал. шум)' = DATA BOOLEAN (Device);        // низкий разброс
+prefWeeks 'Недель усреднять' = DATA INTEGER (Device);          // предпочтит. глубина
+prefCapMax 'Потолок' = DATA DOUBLE (Device, MeasurementType);  // не выше
+prefCapMin 'Пол' = DATA DOUBLE (Device, MeasurementType);      // не ниже
+// Умный паттерн из инструкции экспедитора: полоса «держи 3-4» или рамп «от 3 до 7»
+prefBandLo 'Полоса низ' = DATA DOUBLE (Device, MeasurementType);
+prefBandHi 'Полоса верх' = DATA DOUBLE (Device, MeasurementType);
+prefRamp 'Рамп (низ→верх)' = DATA BOOLEAN (Device, MeasurementType);   // TRUE = «от N до M» линейно; NULL = «держи N-M» полосой
+prefNightPeak 'Ночные пики' = DATA BOOLEAN (Device);
+bandSet (Device d, MeasurementType t) = prefBandLo(d, t) AND prefBandHi(d, t);
+
+// ===== Обучение на ОТВЕТАХ: бот запоминает решения и перестаёт дёргать по тому, что всегда отклоняют =====
+ansYes 'Ответов «да»' = DATA INTEGER (Device);
+ansNo 'Ответов «нет»' = DATA INTEGER (Device);
+noInRow 'Отказов подряд' = DATA INTEGER (Device);
+bfSkip 'Не спрашивать' = DATA BOOLEAN (Device);
+skipAfter () = 3;   // столько «нет» подряд по датчику → больше не спрашиваем (снимается ответом «спрашивай N»)
+// зафиксировать решение и подтянуть статистику
+learnAnswer (Device d, STRING ans) {
+    IF ans = 'да' THEN {
+        ansYes(d) <- (OVERRIDE ansYes(d), 0) + 1;
+        noInRow(d) <- 0;
+        bfSkip(d) <- NULL;                       // раз согласились — датчик снова интересен
+    }
+    ELSE IF ans = 'нет' THEN {
+        ansNo(d) <- (OVERRIDE ansNo(d), 0) + 1;
+        noInRow(d) <- (OVERRIDE noInRow(d), 0) + 1;
+        IF noInRow(d) >= skipAfter() THEN bfSkip(d) <- TRUE;   // хватит спрашивать про этот датчик
+    }
+}
+
+// статус датчика текстом (для ответа на «проверь N»); сам разбор сообщения — ниже, после bfLower
+deviceStatus (Device d) = 'Датчик ' + STRING(id(d)) + ': за вчера точек ' + STRING(OVERRIDE prevDayCount(d), 0)
+    + (IF noPrevDayData(d) THEN ' — ДЫРА за вчера' ELSE ' — данные идут')
+    + '. Всего решений: да ' + STRING(OVERRIDE ansYes(d), 0) + ', нет ' + STRING(OVERRIDE ansNo(d), 0)
+    + (IF bfSkip(d) THEN '. Помечен «не спрашивать».' ELSE '');
+// амплитуда шума с учётом предпочтения (плавно → почти без шума)
+noiseAmp (Device d) = IF prefSmooth(d) THEN 0.004 ELSE 0.03;
+// тип метрики по слову в тексте (по ИМЕНИ типа — устойчиво к разным id на проде/стенде)
+metricType (STRING word) = GROUP MAX MeasurementType t IF posOf(lower(name(t)), word) > 0;
+// null-safe шейпинг значения под предпочтения (2-арг min/max в lsFusion обнуляют при NULL-границе → через IF)
+capHi (Measurement m, MeasurementType t) = IF prefCapMax(device(m), t) AND value(m, t) > prefCapMax(device(m), t) THEN prefCapMax(device(m), t) ELSE value(m, t);
+capLo (Measurement m, MeasurementType t) = IF prefCapMin(device(m), t) AND capHi(m, t) < prefCapMin(device(m), t) THEN prefCapMin(device(m), t) ELSE capHi(m, t);
+shapedValue (Measurement m, MeasurementType t) = IF prefNoDecimals(device(m), t) THEN NUMERIC[16,0](capLo(m, t)) ELSE capLo(m, t);   // round0 в lsFusion НЕ округление (floor+1); целое = NUMERIC[..,0]
+
+// ================= Генерация =================
+// Метод (как ручной бэкфилл 113/118): СКЕЛЕТ (тайминги+каденция) берём с недели назад и сдвигаем
+// в окно пропуска; ЗНАЧЕНИЕ каждой точки = среднее по неделям 1..4 назад (окно ±1.5ч, только те
+// недели, где статус вых/раб дня совпадает с целевым — isDayOff, вкл. офиц. праздники РБ) + шум ±1.5%.
+// Если старых недель нет, среднее вырождается в неделю-1 (мягкая деградация).
+weekSec () = 604800;   // 7 суток
+tolSec () = 5400;      // ±1.5ч: окно поиска соответствующей точки в прошлой неделе
+dateOfSec (LONG s) = DATE(toZDateTime(s));
+dayOffMatch (LONG a, LONG b) = (isDayOff(dateOfSec(a)) AND isDayOff(dateOfSec(b))) OR (NOT isDayOff(dateOfSec(a)) AND NOT isDayOff(dateOfSec(b)));
+// Границы окна ±tol вокруг ts — как ZDATETIME, чтобы сравнивать ПРЯМО с колонкой (см. коммент к prevDayCount).
+// Прежнее nearSec было посекундным и включало ОБА конца: ms >= base-tol AND ms <= base+tol.
+// Верхняя граница поэтому полуоткрытая (+1 сек, строгое <) — см. разбор у selFrom/selTo.
+poolFrom (LONG ts) = toZDateTime(ts - tolSec());
+poolTo   (LONG ts) = toZDateTime(ts + tolSec() + 1);
+// Сумма и количество значений метрики t датчика d в окне ±tol вокруг ts.
+// Сравнение по денормализованным device(m, t)/dateTime(m, t) (MATERIALIZED + INDEX device,dateTime в Measurement.lsf),
+// поэтому окно берётся индексом. getSeconds(dateTime(m)) — функция поверх колонки — блокировала бы индекс и заставляла
+// полный проход по measurement НА КАЖДУЮ генерируемую точку и КАЖДУЮ метрику.
+// device(m, t) = device(m) IF value(m, t), т.е. условие «у точки есть эта метрика» уже встроено.
+poolSum (Device d, MeasurementType t, LONG ts) = GROUP SUM value(Measurement m, t)
+    IF device(m, t) = d AND dateTime(m, t) >= poolFrom(ts) AND dateTime(m, t) < poolTo(ts);
+poolCount (Device d, MeasurementType t, LONG ts) = GROUP SUM 1
+    IF device(Measurement m, t) = d AND dateTime(m, t) >= poolFrom(ts) AND dateTime(m, t) < poolTo(ts);
+// среднее значение метрики t датчика d по пулу (опора base — момент точки-скелета, target — целевой день, wks — глубина недель)
+// Пул — недели 1..4 назад от base, только совпадающие по вых/раб с целевым днём target.
+// dayOffMatch не зависит от измерения, поэтому вынесен ИЗ агрегата: каждое недельное окно — отдельный
+// индексный диапазон вместо OR поверх полного прохода. Окна шириной 3ч и на неделю врозь — не пересекаются.
+// Числитель и знаменатель складывают оконные агрегаты через (+) (NULL-как-0). Это ТОЧНО повторяет master:
+// в lsFusion сам GROUP SUM компилируется в notZero(SUM(...)) (GroupType.SUM), поэтому одиночный GROUP SUM
+// по всему пулу тоже вернул бы NULL для нулевой суммы — расхождения с окно-разбиением нет. Пустой пул:
+// числитель notZero(0)=NULL → avgPool NULL (мягкая деградация как раньше); деление также защищает делитель notZero.
+avgPool (Device d, MeasurementType t, LONG base, LONG target, INTEGER wks) =
+      ( (poolSum(d, t, base)                   IF dayOffMatch(target, base))
+    (+) (poolSum(d, t, base - weekSec())       IF wks >= 2 AND dayOffMatch(target, base - weekSec()))
+    (+) (poolSum(d, t, base - 2 * weekSec())   IF wks >= 3 AND dayOffMatch(target, base - 2 * weekSec()))
+    (+) (poolSum(d, t, base - 3 * weekSec())   IF wks >= 4 AND dayOffMatch(target, base - 3 * weekSec())) )
+    / ( (poolCount(d, t, base)                 IF dayOffMatch(target, base))
+    (+) (poolCount(d, t, base - weekSec())     IF wks >= 2 AND dayOffMatch(target, base - weekSec()))
+    (+) (poolCount(d, t, base - 2 * weekSec()) IF wks >= 3 AND dayOffMatch(target, base - 2 * weekSec()))
+    (+) (poolCount(d, t, base - 3 * weekSec()) IF wks >= 4 AND dayOffMatch(target, base - 3 * weekSec())) );
+
+// Целевое значение по ИНСТРУКЦИИ (перебивает 4-нед среднее): рамп «от N до M» = линейный подъём по позиции
+// точки в окне + 10% шум; полоса «держи N-M» = равномерно внутри [N,M] (естественный «шум в полосе»).
+rampPos (LONG ms, BackfillRequest req) = NUMERIC[16,4](ms - fromSec(req)) / (toSec(req) - fromSec(req) + 1);
+bandTarget (Device d, MeasurementType t, LONG ms, BackfillRequest req) =
+    IF prefRamp(d, t)
+    THEN prefBandLo(d, t) + (prefBandHi(d, t) - prefBandLo(d, t)) * rampPos(ms, req) + (random() - 0.5) * (prefBandHi(d, t) - prefBandLo(d, t)) * 0.1
+    ELSE prefBandLo(d, t) + random() * (prefBandHi(d, t) - prefBandLo(d, t));
+
+// Двухфазно (коррелированный агрегат внутри NEW даёт NPE компилятора → set-based апдейт отдельной фазой):
+generateBackfill (BackfillRequest req) {
+    IF device(req) THEN {
+        // фаза 1: скелет — переносим точки недели назад (реальная каденция и тайминги) в окно пропуска
+        // границы — прямо по dateTime(src) (INDEX device, dateTime в Measurement.lsf), окно заявки сдвинуто
+        // на неделю назад; полуоткрытый интервал — как у selFrom/selTo. dayOffMatch остаётся на секундах,
+        // но он не диапазонный предикат и считается уже по суженному индексом набору.
+        FOR device(Measurement src) = device(req)
+            AND dateTime(src) >= toZDateTime(fromSec(req) - weekSec() + 1)
+            AND dateTime(src) <  toZDateTime(toSec(req) - weekSec() + 1)
+            AND dayOffMatch(getSeconds(dateTime(src)) + weekSec(), getSeconds(dateTime(src)))
+            // ИДЕМПОТЕНТНОСТЬ: не создавать точку, если на это время у датчика уже есть измерение
+            // (индексный existence-check по device,dateTime) → повторный/параллельный запуск НЕ плодит дубли
+            AND NOT (GROUP SUM 1 IF device(Measurement ex) = device(req) AND dateTime(ex) = toZDateTime(getSeconds(dateTime(src)) + weekSec()))
+        DO NEW m = Measurement {
+            device(m) <- device(req);
+            dateTime(m) <- toZDateTime(getSeconds(dateTime(src)) + weekSec());
+            FOR value(src, MeasurementType t) DO value(m, t) <- value(src, t);
+        }
+        APPLY;   // фаза 1 закоммичена: фаза 2 читает уже сохранённые точки (LOCAL после APPLY обнулился бы — потому опираемся на device(req))
+        // фаза 2: значение = среднее по неделям 1..4 назад + шум ±1.5% (только созданные точки окна пропуска).
+        // ПО-ТОЧЕЧНО (FOR ... DO), НЕ set-based: в set-based апдейте аргумент base=getSeconds(dateTime(m))-week
+        // у avgPool коррелирован с каждой внешней точкой, и компилятор НЕ проталкивает коррелированный интервал
+        // (и равенство по датчику) в индексный джойн — получается декартово «целевые точки × вся measurement»
+        // → спилл на десятки ГБ (инцидент 2026-07-27). В FOR-DO m/t связаны конкретными объектами, поэтому
+        // avgPool считается со СКАЛЯРНЫМИ границами → индексный доступ (EXPLAIN: 5.7мс на точку).
+        // окно — по device(m, t)/dateTime(m, t) (INDEX device, dateTime); value(m,t) уже встроено в device(m,t).
+        FOR device(Measurement m, MeasurementType t) = device(req)
+            AND dateTime(m, t) >= selFrom(req) AND dateTime(m, t) < selTo(req) DO
+            value(m, t) <- (OVERRIDE
+                (bandTarget(device(m), t, getSeconds(dateTime(m)), req) IF bandSet(device(m), t)),        // есть инструкция «держи/от…до» → по ней
+                avgPool(device(m), t, getSeconds(dateTime(m)) - weekSec(), getSeconds(dateTime(m)), OVERRIDE weeksBack(req), prefWeeks(device(req)), 4) * (1 + (random() - 0.5) * noiseAmp(device(m))));
+        APPLY;   // зафиксировать значения перед фазой 3 (шейпинг читает уже сохранённое)
+        // фаза 3: выученные предпочтения — одной операцией через shapedValue (кламп потолок/пол + округление)
+        value(Measurement m, MeasurementType t) <- shapedValue(m, t)
+            WHERE device(m, t) = device(req) AND dateTime(m, t) >= selFrom(req) AND dateTime(m, t) < selTo(req);
+        genAt(req) <- currentZDateTime();
+        genCount(req) <- reqGenCount(req);   // сколько точек дозаполнено (снимок)
+        liveAtGen(req) <- bfLive();
+        stage(req) <- 'generated';
+    }
+    APPLY;
+}
+
+// ================= Telegram: отправка/приём =================
+// Канал задаётся ДАННЫМИ (не GROUP MAX по имени: под одним telegram-id висит несколько объектов Chat
+// с разными именами, и выбор был бы случайным). Нужен ЛИЧНЫЙ чат: в группе privacy режет обычный текст,
+// поэтому ответы «да»/«нет» до бота не доходят (водители тоже пишут машинным ботам в личку).
+// Настройка через eval: bfAccount() <- (GROUP MAX Messenger.Account a IF Messenger.name(a) = 'DomFarm');
+//                       bfChatIdData() <- '576070201';
+bfAccount = DATA Messenger.Account ();
+bfChatIdData 'Telegram chat id' = DATA STRING[30] ();
+bfChatId () = bfChatIdData();
+bfToken () = Messenger.token(bfAccount());
+bfSentId = DATA LOCAL LONG ();
+GROUP bfSendResult EXTID 'result';
+FORM bfSendResultForm PROPERTIES () IN bfSendResult bfSentId EXTID 'message_id';
+// reply-клавиатура [Да][Нет] / [Ок][Переделать] — percent-энкод (lsFusion ломает '{' в URL)
+kbYesNo () = '%7B%22keyboard%22%3A%5B%5B%22Да%22%2C%22Нет%22%5D%5D%2C%22resize_keyboard%22%3Atrue%2C%22one_time_keyboard%22%3Atrue%7D';
+kbOkRedo () = '%7B%22keyboard%22%3A%5B%5B%22Ок%22%2C%22Переделать%22%5D%5D%2C%22resize_keyboard%22%3Atrue%2C%22one_time_keyboard%22%3Atrue%7D';
+// chat_id получателя из белого списка = чат его ПОСЛЕДНЕГО сообщения нашему боту (@-толерантно).
+// Чтобы бот мог написать человеку, тот должен был раньше нажать Start и хоть раз написать боту.
+bfChatFor (STRING whom) = GROUP LAST STRING(Messenger.id(Messenger.chat(Messenger.Message m)))
+    ORDER Messenger.dateTime(m), m
+    IF (Messenger.from(m) = whom OR ('@' + Messenger.from(m)) = whom) AND Messenger.account(Messenger.chat(m)) = bfAccount();
+
+bfSendOne (STRING chatId, STRING txt) {
+    LOCAL result = JSONFILE ();
+    IF bfToken() AND chatId THEN TRY {
+        EXTERNAL HTTP POST 'https://api.telegram.org/bot' + bfToken() + '/sendMessage'
+            BODYURL 'chat_id=' + chatId + '&text=' + txt TO result;
+    }
+}
+
+// Рассылаем КАЖДОМУ из белого списка (в его личный чат), у кого известен chat_id.
+bfSend (STRING txt, STRING markup) {
+    FOR BfSender s IS BfSender AND bfChatFor(whFrom(s)) DO
+        bfSendOne(bfChatFor(whFrom(s)), txt);
+}
+
+// ================= Ежедневная проверка 12:00: собрать дыры → одна заявка на датчик → спросить =================
+backfillDailyCheck 'Дозаполнение: ежедневная проверка' () {
+    LOCAL txt = TEXT (); txt() <- '';
+    LOCAL any = INTEGER (); any() <- 0;
+    // NOT bfSkip(d) — выученное: по датчику трижды подряд ответили «нет», больше не дёргаем (см. learnAnswer)
+    // Скоуп ВСЕГДА = реально передающие датчики (ecoDevice: MITE_ECO_2 + SIM). bfLive НЕ расширяет скоуп
+    // на все устройства — иначе в боевом попадали бы 170 мёртвых/списанных (молчат >30 дней) → спам и мусор.
+    // bfLive управляет ТОЛЬКО записью (тест: пометить; боевой: реально дозаполнить) — см. approved/done ниже.
+    FOR Device d IS Device AND noPrevDayData(d) AND NOT openRequest(d) AND NOT bfSkip(d) AND ecoDevice(d) AND NOT deviceUnderVerification(d) DO {
+        NEW r = BackfillRequest {
+            device(r) <- d;
+            fromSec(r) <- prevDayStart();  // окно = только вчерашние сутки
+            toSec(r) <- prevDayEnd();
+            stage(r) <- 'asked';
+            created(r) <- currentZDateTime();
+        }
+        txt() <- txt() + (IF any() > 0 THEN ', ' ELSE '') + STRING(id(d));
+        any() <- any() + 1;
+    }
+    // ★APPLY СБРАСЫВАЕТ LOCAL: без NESTED здесь any()/txt() обнулялись, условие ниже становилось ложным
+    // и сообщение НЕ уходило никогда — заявки создавались, а бот молчал. NESTED сохраняет их через APPLY.
+    APPLY NESTED (txt, any);
+    // reply_markup (клавиатура) ломается в EXTERNAL HTTP → шлём без неё; бот ловит слова в тексте.
+    // В группе у бота privacy ON: отвечать надо Reply-ем на это сообщение (иначе Telegram его боту не отдаст).
+    IF any() > 0 THEN
+        bfSend('За прошлые сутки (' + toDateDDMMYYYY(sum(currentDate(), -1)) + ') нет данных по датчику(ам) ' + txt() + '. Дозаполнить за этот день по паттерну прошлых недель? Ответьте на это сообщение (Reply): да или нет', '');
+    ELSE
+        bfSend('Проверка 12:00: за прошлые сутки (' + toDateDDMMYYYY(sum(currentDate(), -1)) + ') пропусков по датчикам нет.', '');
+}
+
+// ответы: обрабатываем входящее сообщение (reply-кнопки шлют текст)
+processedBf 'Обработано (backfill)' = DATA BOOLEAN (Messenger.Message);
+bfLower (Messenger.Message m) = lower(trim(Messenger.message(m)));
+bfHas (Messenger.Message m, STRING sub) = length(bfLower(m)) > length(replace(bfLower(m), sub, ''));
+// ===== Вопрос «проверь N» / «что с N» — статус датчика по запросу (раньше такой команды не было) =====
+wantsCheck (Messenger.Message m) = posOf(bfLower(m), 'провер') > 0 OR posOf(bfLower(m), 'что с') > 0 OR posOf(bfLower(m), 'статус') > 0;
+// «проверь N» принимает и полный id, и короткий хвост (3 цифры, напр. «проверь 003») — по eco-датчикам
+checkDevice (Messenger.Message m) = GROUP MAX Device d IF posOf(bfLower(m), STRING(id(d))) > 0
+    OR (ecoDevice(d) AND posOf(bfLower(m), right(STRING(id(d)), 3)) > 0);
+// ---- Пер-датчиковый разбор ответа ----
+// позиция упоминания датчика: полный id, иначе хвост (последние 3 цифры)
+refPos (STRING msg, STRING fullId, STRING tail) = OVERRIDE (posOf(msg, fullId) IF posOf(msg, fullId) > 0), (posOf(msg, tail) IF posOf(msg, tail) > 0);
+// ответ по датчику: 'да'/'нет'/NULL. Нет цифр в сообщении → глобальный ответ (на все).
+// Есть цифры → берём ближайшее да/нет ПОСЛЕ упоминания датчика.
+// Ответ «на все» (глобальный): либо в тексте вообще нет цифр, либо явно сказано «по всем»/«всем»/«все».
+// Иначе «Нет по всем датчикам. А проверь 110?» не срабатывало: из-за «110» сообщение считалось адресным,
+// а 110 ни к одной открытой заявке не относится → глобальное «нет» терялось.
+globalAns (STRING msg) = hasDigit(msg, '[0-9]') = 0 OR posOf(msg, 'всем') > 0 OR posOf(msg, 'все ') > 0;
+// ★ПОДСТРОКА vs СЛОВО: искать «да» через posOf НЕЛЬЗЯ — оно сидит в «заДАчу», «ДАнные», «наДА», «правДА».
+// Живой случай: «Нет по всем и закрой заДАчу» → бот записал ДА. Матчим ТОЛЬКО целое слово (границы = не буква/цифра).
+// Регэксп собираем в lsFusion-строке и передаём параметром в hasDigit ($1 ~ $2): кавычки внутри FORMULA lsFusion не парсит.
+wordPat (STRING w) = '(^|[^a-zа-яё0-9])' + w + '([^a-zа-яё0-9]|$)';
+hasWord (STRING s, STRING w) = hasDigit(s, wordPat(w));
+// «нет» приоритетнее «да»: если оба сигнала есть — считаем отказом (для фарм-данных безопаснее не трогать).
+// Понимаем и естественные слова: залей/заполни/дозаполни/исправь → да; не трогай/оставь/пропусти/не надо → нет.
+// Отрицания («не залей», «не заполняй») ловим в блоке «нет» ПЕРВЫМИ, поэтому «залей»-ветка их уже не перехватит.
+ansWord (STRING seg) =
+    IF hasWord(seg, 'нет') > 0 OR posOf(seg, 'не трог') > 0 OR posOf(seg, 'не зал') > 0
+       OR posOf(seg, 'не заполн') > 0 OR posOf(seg, 'не исправ') > 0 OR posOf(seg, 'не надо') > 0
+       OR posOf(seg, 'оставь') > 0 OR posOf(seg, 'пропус') > 0
+    THEN 'нет'
+    ELSE (IF hasWord(seg, 'да') > 0 OR posOf(seg, 'зал') > 0 OR posOf(seg, 'заполн') > 0
+       OR posOf(seg, 'исправь') > 0 OR posOf(seg, 'исправл') > 0
+    THEN 'да');
+parseAns (STRING msg, STRING fullId, STRING tail) =
+    IF globalAns(msg) THEN ansWord(msg)
+    ELSE IF refPos(msg, fullId, tail) > 0 THEN ansWord(suffixFrom(msg, refPos(msg, fullId, tail)));
+// удобная обёртка над сообщением и датчиком заявки
+ansForReq (Messenger.Message m, BackfillRequest r) = parseAns(bfLower(m), STRING(id(device(r))), right(STRING(id(device(r))), 3));
+// глубина усреднения из текста рядом с упоминанием датчика: «прошлую/одну неделю»=1, «пару/две недели»=2, «три»=3, «четыре»=4; нет упоминания → NULL (=дефолт 4)
+segAfter (STRING msg, STRING fullId, STRING tail) = left(suffixFrom(msg, refPos(msg, fullId, tail)), 50);
+parseWeeks (STRING msg, STRING fullId, STRING tail) =
+    IF posOf(segAfter(msg, fullId, tail), 'недел') > 0 THEN
+        (IF posOf(segAfter(msg, fullId, tail), 'пар') > 0 OR posOf(segAfter(msg, fullId, tail), 'две') > 0 THEN 2
+         ELSE (IF posOf(segAfter(msg, fullId, tail), 'три') > 0 THEN 3
+         ELSE (IF posOf(segAfter(msg, fullId, tail), 'четыр') > 0 THEN 4 ELSE 1)));
+weeksForReq (Messenger.Message m, BackfillRequest r) = parseWeeks(bfLower(m), STRING(id(device(r))), right(STRING(id(device(r))), 3));
+// первое число после ключевого слова в тексте (SQL regexp; re передаём literal'ом)
+firstNum (STRING s, STRING re) = FORMULA DOUBLE '(regexp_match($1, $2))[1]::double precision';
+segCapMax (STRING seg) = firstNum(seg, '(?:выше|более|макс)[^0-9]*([0-9]+)');
+// две границы из «держи 3-4», «от 3 до 7», «3-4»: низ и верх (десятичные . или ,)
+segLo (STRING seg) = firstNum(replace(seg, ',', '.'), '(-?[0-9]+(?:[.][0-9]+)?) *(?:-|до) *-?[0-9]');
+segHi (STRING seg) = firstNum(replace(seg, ',', '.'), '[0-9] *(?:-|до) *(-?[0-9]+(?:[.][0-9]+)?)');
+// «от … до …» = рамп (линейный подъём низ→верх); «N-M»/«держи N-M» = полоса (колебания внутри)
+isRampSeg (STRING seg) = posOf(seg, 'от') > 0 AND posOf(seg, 'до') > 0;
+// метрика t упомянута в тексте (по 4-символьному префиксу её имени: темп/влаж/бата/вибр)
+metricInSeg (STRING seg, MeasurementType t) = posOf(seg, left(lower(name(t)), 4)) > 0;
+// в тексте не названа ни одна метрика → инструкция «на все»
+noMetricInSeg (STRING seg) = NOT (GROUP SUM 1 IF MeasurementType t IS MeasurementType AND metricInSeg(seg, t));
+// ОБУЧЕНИЕ: разобрать фидбэк из сегмента текста → сохранить предпочтения per-датчик/метрику
+learnPrefs (Device d, STRING seg) {
+    // шум: «плавно»/«ровно»/«без шума» → почти без шума; «с шумом»/«небольшой»/«разброс» → шум есть
+    IF posOf(seg, 'плавн') > 0 OR posOf(seg, 'ровно') > 0 OR posOf(seg, 'без шум') > 0 THEN prefSmooth(d) <- TRUE;
+    IF posOf(seg, 'с шум') > 0 OR posOf(seg, 'небольш') > 0 OR posOf(seg, 'разброс') > 0 THEN prefSmooth(d) <- NULL;
+    // без сотых/целым: для названной метрики, а если метрика не названа — для всех
+    IF posOf(seg, 'сот') > 0 OR posOf(seg, 'цел') > 0 THEN
+        FOR MeasurementType t IS MeasurementType AND (metricInSeg(seg, t) OR noMetricInSeg(seg)) DO prefNoDecimals(d, t) <- TRUE;
+    // потолок «не выше N» — для названной метрики
+    IF segCapMax(seg) THEN
+        FOR MeasurementType t2 IS MeasurementType AND metricInSeg(seg, t2) DO prefCapMax(d, t2) <- segCapMax(seg);
+    // ПОЛОСА/РАМП: «держи 3-4» / «от 3 до 7» → цель заполнения (для названной метрики или для всех)
+    IF segLo(seg) AND segHi(seg) THEN
+        FOR MeasurementType t3 IS MeasurementType AND (metricInSeg(seg, t3) OR noMetricInSeg(seg)) DO {
+            prefBandLo(d, t3) <- segLo(seg);
+            prefBandHi(d, t3) <- segHi(seg);
+            prefRamp(d, t3) <- (TRUE IF isRampSeg(seg));
+        }
+    // ночные пики
+    IF posOf(seg, 'ночн') > 0 THEN prefNightPeak(d) <- TRUE;
+}
+// сегмент фидбэка для датчика: текст рядом с его упоминанием, а если не упомянут — всё сообщение (глобальная инструкция)
+segForReq (Messenger.Message m, BackfillRequest r) = OVERRIDE segAfter(bfLower(m), STRING(id(device(r))), right(STRING(id(device(r))), 3)), bfLower(m);
+// сводка подтверждения по текущим стадиям (для одного цикла = итог этого сообщения)
+// Сводка ТОЛЬКО по заявкам, закрытым ЭТИМ сообщением (answeredBy проставляется тут же), а не по всей истории.
+// Раньше собирались все done/approved за всё время → бот вечно рапортовал «Да: 1210000203» (заявка от 11.07)
+// в ответ на любое сообщение, даже когда не понял ни слова.
+// Итог рассылается ВСЕМ из белого списка и НАЗЫВАЕТ, кто ответил — чтобы Mia (и остальные в чате) видели
+// решения Владимира, не видя его личных сообщений (разные личка-чаты Telegram).
+bfSummary (Messenger.Message m) = (OVERRIDE Messenger.from(m), 'Экспедитор') + ' ответил(а). Да: ' + (OVERRIDE (GROUP CONCAT STRING(id(device(BackfillRequest r))) IF answeredMsg(r) = m AND (stage(r) = 'done' OR stage(r) = 'approved'), ', ' ORDER r), '—')
+             + '. Нет: ' + (OVERRIDE (GROUP CONCAT STRING(id(device(BackfillRequest r2))) IF answeredMsg(r2) = m AND stage(r2) = 'rejected', ', ' ORDER r2), '—')
+             + (IF bfLive() THEN (IF (GROUP SUM 1 IF answeredMsg(BackfillRequest ra) = m AND stage(ra) = 'approved') > 0 THEN '. Дозаполняю отмеченные, пришлю на проверку.' ELSE '. Одобренных нет — данные не трогаю.') ELSE '. Тест-режим: данные не трогаю.');
+
+// релевантно ли сообщение (есть сигнал ответа/предпочтения/номер открытого датчика) — иначе игнор
+bfRelevant (Messenger.Message m) =
+       posOf(bfLower(m), 'да') > 0 OR posOf(bfLower(m), 'нет') > 0 OR posOf(bfLower(m), 'ок') > 0 OR posOf(bfLower(m), 'передела') > 0
+    OR posOf(bfLower(m), 'цел') > 0 OR posOf(bfLower(m), 'сот') > 0 OR posOf(bfLower(m), 'плавн') > 0 OR posOf(bfLower(m), 'разброс') > 0
+    OR posOf(bfLower(m), 'выше') > 0 OR posOf(bfLower(m), 'ниже') > 0 OR posOf(bfLower(m), 'недел') > 0
+    OR posOf(bfLower(m), 'зал') > 0 OR posOf(bfLower(m), 'заполн') > 0 OR posOf(bfLower(m), 'исправ') > 0
+    OR posOf(bfLower(m), 'трог') > 0 OR posOf(bfLower(m), 'оставь') > 0 OR posOf(bfLower(m), 'пропус') > 0
+    OR (GROUP SUM 1 IF BackfillRequest r IS BackfillRequest AND (stage(r) = 'asked' OR stage(r) = 'checking') AND posOf(bfLower(m), right(STRING(id(device(r))), 3)) > 0) > 0;
+
+// ВАЖНО: тело исполняется в транзакции вставки входящего (вебхук). APPLY и тяжёлую работу (генерация)
+// здесь НЕЛЬЗЯ — только смена стадий + отправка ответа. Генерацию делает bfWorker() по расписанию.
+processBfMsg (Messenger.Message m) {
+    // фильтр «левых»: наш бот (аккаунт DomFarm) + отправитель в белом списке + есть открытая заявка + сообщение релевантно.
+    // НЕ матчим по конкретному chat_id — иначе слышим только один чат. Пускаем ЛЮБОГО из белого списка
+    // из его личного чата с нашим ботом (аккаунт-гард отсекает чужих ботов/водителей, «Выехал» и т.п.).
+    IF Messenger.from(m) != 'YOU' AND NOT processedBf(m) AND anyOpenRequest()
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m))
+        AND bfRelevant(m) THEN {
+        // пер-датчиковый разбор: по каждой открытой заявке — учим предпочтения из ЛЮБОГО сообщения + да/нет
+        LOCAL closed = INTEGER (); closed() <- 0;   // сколько заявок реально закрыто ЭТИМ сообщением
+        FOR BackfillRequest r IS BackfillRequest AND stage(r) = 'asked' DO {
+            learnPrefs(device(r), segForReq(m, r));             // выучить фидбэк (даже без «да»): «батарею целым» и т.п.
+            IF ansForReq(m, r) = 'да'  THEN {
+                weeksBack(r) <- weeksForReq(m, r);              // глубина усреднения из текста (NULL → дефолт)
+                prefWeeks(device(r)) <- weeksForReq(m, r);      // запомнить глубину для датчика
+                answeredBy(r) <- Messenger.from(m); answerText(r) <- left(Messenger.message(m), 200); answeredAt(r) <- currentZDateTime();
+                answeredMsg(r) <- m;
+                stage(r) <- (IF bfLive() THEN 'approved' ELSE 'done');
+                learnAnswer(device(r), 'да');
+                closed() <- closed() + 1;
+            }
+            ELSE IF ansForReq(m, r) = 'нет' THEN {
+                answeredBy(r) <- Messenger.from(m); answerText(r) <- left(Messenger.message(m), 200); answeredAt(r) <- currentZDateTime();
+                answeredMsg(r) <- m;
+                stage(r) <- 'rejected';
+                learnAnswer(device(r), 'нет');
+                closed() <- closed() + 1;
+            }
+        }
+        // стадия проверки: ок/переделать (переделать — заодно учим предпочтения из фидбэка)
+        FOR BackfillRequest r3 IS BackfillRequest AND stage(r3) = 'checking' DO {
+            IF bfHas(m, 'ок') THEN stage(r3) <- 'done';
+            ELSE IF bfHas(m, 'передела') THEN { learnPrefs(device(r3), segForReq(m, r3)); stage(r3) <- 'redo'; }
+        }
+        // Вопрос «проверь N» / «что с N» — отвечаем статусом датчика (в одном сообщении можно и ответить, и спросить)
+        IF wantsCheck(m) AND checkDevice(m) THEN {
+            bfSend(deviceStatus(checkDevice(m)), '');
+            processedBf(m) <- TRUE;
+        }
+        // Не разобрали ни одной заявки → честно сказать «не понял» и НЕ помечать сообщение обработанным,
+        // иначе вопрос молча висит открытым, а человек уверен, что ответил (так и вышло с «Нет по всем... 110?»).
+        IF closed() > 0 THEN {
+            processedBf(m) <- TRUE;
+            bfSend(bfSummary(m), '');
+        } ELSE IF NOT (wantsCheck(m) AND checkDevice(m)) THEN
+            bfSend('Не понял ответ. Напишите «да» или «нет» — применится ко всем открытым; либо адресно «203 нет». Ещё умею: «проверь 1210000110». Открытые: '
+                 + (OVERRIDE (GROUP CONCAT STRING(id(device(BackfillRequest ro))) IF stage(ro) = 'asked', ', ' ORDER ro), '—'), '');
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO processBfMsg(m);
+
+// ===== Ретрансляция: сообщение любого из белого списка видно ВСЕМ остальным =====
+// У каждого своя личка с ботом (Telegram privacy в группе режет текст), поэтому Mia не видит, что пишет
+// Владимир, и наоборот. Бот дословно пересылает каждое сообщение участника белого списка остальным.
+processedRelay 'Ретранслировано' = DATA BOOLEAN (Messenger.Message);
+relayBfMsg (Messenger.Message m) {
+    IF Messenger.from(m) != 'YOU' AND NOT processedRelay(m)
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m)) THEN {
+        FOR BfSender s IS BfSender AND bfChatFor(whFrom(s))
+            AND whFrom(s) != Messenger.from(m) AND whFrom(s) != ('@' + Messenger.from(m)) DO
+            bfSendOne(bfChatFor(whFrom(s)), Messenger.from(m) + ': ' + Messenger.message(m));
+        processedRelay(m) <- TRUE;
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO relayBfMsg(m);
+
+// ===== Команда «проверь всё за прошлые сутки по всем датчикам» → ответить списком дыр =====
+// «проверь <номер>» (один датчик) обрабатывается в processBfMsg; здесь — общий запрос БЕЗ номера.
+wantsCheckAll (Messenger.Message m) = wantsCheck(m) AND NOT checkDevice(m)
+    AND (posOf(bfLower(m), 'все') > 0 OR posOf(bfLower(m), 'всем') > 0 OR posOf(bfLower(m), 'сутки') > 0
+      OR posOf(bfLower(m), 'день') > 0 OR posOf(bfLower(m), 'вчера') > 0 OR posOf(bfLower(m), 'данны') > 0);
+gapsPrevDayText () = OVERRIDE (GROUP CONCAT STRING(id(Device d)) IF noPrevDayData(d) AND ecoDevice(d) AND NOT deviceUnderVerification(d), ', ' ORDER d), '—';
+processedCheckAll 'Обработано (проверь всё)' = DATA BOOLEAN (Messenger.Message);
+processCheckAllMsg (Messenger.Message m) {
+    IF Messenger.from(m) != 'YOU' AND NOT processedCheckAll(m)
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m))
+        AND wantsCheckAll(m) THEN {
+        bfSend('Проверка за прошлые сутки (' + toDateDDMMYYYY(sum(currentDate(), -1)) + '): без данных — ' + gapsPrevDayText(), '');
+        processedCheckAll(m) <- TRUE;
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO processCheckAllMsg(m);
+
+// ===== On-demand команды: «дозаполни/проверь <датчик> за <дату>» (для рулёжки ботом из личного чата) =====
+// дату берём из текста: «сегодня»/«вчера»/«позавчера» или «ДД.ММ.ГГГГ»/«ДД.ММ» (год текущий).
+// регэксп и формат — ПАРАМЕТРАМИ (кавычки внутри FORMULA lsFusion не парсит, см. firstNum).
+reDate (STRING s, STRING re) = FORMULA STRING '(regexp_match($1, $2))[1]';
+strToDate (STRING s, STRING fmt) = FORMULA DATE 'to_date($1, $2)';
+// регэксп БЕЗ фигурных скобок — lsFusion трактует {n} как ключ интерполяции и портит паттерн
+cmdDate (Messenger.Message m) =
+    IF posOf(bfLower(m), 'позавчера') > 0 THEN sum(currentDate(), -2)
+    ELSE IF posOf(bfLower(m), 'сегодня') > 0 THEN currentDate()
+    ELSE IF posOf(bfLower(m), 'вчера') > 0 THEN sum(currentDate(), -1)
+    ELSE IF length(reDate(bfLower(m), '[0-9][0-9]?[.][0-9][0-9]?[.][0-9][0-9][0-9][0-9]')) > 0
+        THEN strToDate(reDate(bfLower(m), '[0-9][0-9]?[.][0-9][0-9]?[.][0-9][0-9][0-9][0-9]'), 'DD.MM.YYYY')
+    ELSE IF length(reDate(bfLower(m), '[0-9][0-9]?[.][0-9][0-9]?')) > 0
+        THEN strToDate(reDate(bfLower(m), '[0-9][0-9]?[.][0-9][0-9]?') + '.' + left(STRING(currentDate()), 4), 'DD.MM.YYYY');
+withNoise (Messenger.Message m) = posOf(bfLower(m), 'колеб') > 0 OR posOf(bfLower(m), 'шум') > 0 OR posOf(bfLower(m), 'разброс') > 0;
+// номер датчика берём РЯДОМ со словом «датчик» («датчику 004» / «042 датчику»),
+// а НЕ по всему тексту — иначе «2026» в дате или «4-6» в диапазоне ловятся как датчик.
+// явный IF (не OVERRIDE — тот путал пустую строку с null): «042 датчику» или «датчику 004»
+devNumStr (Messenger.Message m) =
+    IF length(reDate(bfLower(m), '([0-9]+) +датчик')) > 0 THEN reDate(bfLower(m), '([0-9]+) +датчик')
+    ELSE (reDate(bfLower(m), 'датчик[а-яё]* +([0-9]+)') IF length(reDate(bfLower(m), 'датчик[а-яё]* +([0-9]+)')) > 0);
+cmdDevice (Messenger.Message m) = GROUP MAX Device d IF ecoDevice(d)
+    AND (right(STRING(id(d)), 3) = devNumStr(m) OR STRING(id(d)) = devNumStr(m));
+// диапазон значений: сегмент после «диапазон»/«держи» → segLo/segHi (уже есть)
+bandSeg (Messenger.Message m) = OVERRIDE
+    (suffixFrom(bfLower(m), posOf(bfLower(m), 'диапазон')) IF posOf(bfLower(m), 'диапазон') > 0),
+    (suffixFrom(bfLower(m), posOf(bfLower(m), 'держи')) IF posOf(bfLower(m), 'держи') > 0);
+cmdBandLo (Messenger.Message m) = segLo(bandSeg(m));
+cmdBandHi (Messenger.Message m) = segHi(bandSeg(m));
+// окно по времени суток: часы РЯДОМ С МАРКЕРОМ (.00 / утра / вечера / ч) — так отличаем от диапазона «4 до 6» (без маркеров)
+cmdFromHour (Messenger.Message m) = firstNum(bfLower(m), 'с +([0-9][0-9]?)(?:[.:][0-9][0-9]| ?утра| ?вечера| ?час| ?ч)');
+cmdToHour (Messenger.Message m) = firstNum(bfLower(m), 'до +([0-9][0-9]?)(?:[.:][0-9][0-9]| ?утра| ?вечера| ?час| ?ч)');
+hasTimeWindow (Messenger.Message m) = cmdFromHour(m) AND cmdToHour(m);
+cmdFromSec (Messenger.Message m) = getSeconds(ZDATETIME(toDateTime(cmdDate(m), sumMinutes(00:00, INTEGER(cmdFromHour(m)) * 60))));
+cmdToSec (Messenger.Message m) = getSeconds(ZDATETIME(toDateTime(cmdDate(m), sumMinutes(00:00, INTEGER(cmdToHour(m)) * 60))));
+// Глаголы «залить данные» отдельно от параметров: если глагол есть, а датчика/даты нет — переспрашиваем,
+// а не молчим. «заполн» покрывает и «дозаполни», «перестро»/«замен» — формулировки Владимира.
+wantsFillLike (Messenger.Message m) = posOf(bfLower(m), 'заполн') > 0 OR posOf(bfLower(m), 'залей') > 0
+    OR posOf(bfLower(m), 'залив') > 0 OR posOf(bfLower(m), 'корректир') > 0 OR posOf(bfLower(m), 'поправ') > 0
+    OR posOf(bfLower(m), 'перестро') > 0 OR posOf(bfLower(m), 'замен') > 0;
+wantsFillCmd (Messenger.Message m) = wantsFillLike(m) AND cmdDevice(m) AND cmdDate(m);
+// статус датчика за КОНКРЕТНУЮ дату (не только «вчера»)
+countAt (Device d, DATE dt) = GROUP SUM 1 IF device(Measurement m) = d AND dateTime(m) >= toZDateTime(dt) AND dateTime(m) < toZDateTime(sum(dt, 1));
+statusAtDate (Device d, DATE dt) = 'Датчик ' + STRING(id(d)) + ' за ' + toDateDDMMYYYY(dt) + ': точек ' + STRING(OVERRIDE countAt(d, dt), 0)
+    + (IF deviceUnderVerification(d) THEN ' (на поверке — не трогаю)' ELSE '');
+// человекочитаемое «что делаю» — в ответ отправителю
+cmdWhat (Messenger.Message m) = 'датчик ' + STRING(id(cmdDevice(m))) + ' за ' + toDateDDMMYYYY(cmdDate(m))
+    + (IF hasTimeWindow(m) THEN ' с ' + STRING(INTEGER(cmdFromHour(m))) + ':00 до ' + STRING(INTEGER(cmdToHour(m))) + ':00' ELSE ' (весь день)')
+    + (IF cmdBandLo(m) AND cmdBandHi(m) THEN ', диапазон ' + STRING(NUMERIC[10,1](cmdBandLo(m))) + '-' + STRING(NUMERIC[10,1](cmdBandHi(m))) ELSE '')
+    + (IF withNoise(m) THEN ', с колебаниями' ELSE '');
+
+// ВАЖНО: WHEN-вебхук → NEW/смена данных МОЖНО, APPLY/генерацию НЕЛЬЗЯ. Заявку создаём, заливает воркер.
+processedCmd 'Обработано (команда)' = DATA BOOLEAN (Messenger.Message);
+processCmdMsg (Messenger.Message m) {
+    IF Messenger.from(m) != 'YOU' AND NOT processedCmd(m)
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m)) THEN {
+        // заполнить/откорректировать: «дозаполни/откорректируй <датчик> [диапазон A-B] за <дату> [с H до H] [с колебаниями]»
+        IF wantsFillCmd(m) THEN {
+            IF deviceUnderVerification(cmdDevice(m)) THEN
+                bfSend('Датчик ' + STRING(id(cmdDevice(m))) + ' на поверке — не заливаю.', '');
+            ELSE {
+                IF cmdBandLo(m) AND cmdBandHi(m) THEN
+                    FOR MeasurementType t IS MeasurementType AND left(lower(name(t)), 4) = 'темп' DO {
+                        prefBandLo(cmdDevice(m), t) <- cmdBandLo(m);
+                        prefBandHi(cmdDevice(m), t) <- cmdBandHi(m);
+                    }
+                IF withNoise(m) THEN prefSmooth(cmdDevice(m)) <- NULL;   // «с колебаниями» = шум есть (не сглаживать)
+                NEW r = BackfillRequest {
+                    device(r) <- cmdDevice(m);
+                    fromSec(r) <- (IF hasTimeWindow(m) THEN cmdFromSec(m) ELSE getSeconds(toZDateTime(cmdDate(m))));
+                    toSec(r) <- (IF hasTimeWindow(m) THEN cmdToSec(m) ELSE getSeconds(toZDateTime(sum(cmdDate(m), 1))));
+                    stage(r) <- (IF bfLive() THEN 'approved' ELSE 'done');
+                    created(r) <- currentZDateTime();
+                    answeredBy(r) <- Messenger.from(m);
+                }
+                bfSend((IF bfLive() THEN 'Принял. Заполняю ' + cmdWhat(m) + '. Пришлю на проверку, как готово.'
+                     ELSE 'Тест-режим (боевой выкл): ' + cmdWhat(m) + ' — пометил, но не заливаю.'), '');
+            }
+            processedCmd(m) <- TRUE;
+        }
+        // статус: «проверь <датчик> за <дату>»
+        ELSE IF wantsCheck(m) AND cmdDevice(m) AND cmdDate(m) THEN {
+            bfSend(statusAtDate(cmdDevice(m), cmdDate(m)) + ' Всё верно? Ответьте «ок» или напишите, что поправить.', '');
+            processedCmd(m) <- TRUE;
+        }
+        // команда понятна по смыслу, но не хватает датчика или даты — уточняем, а не молчим
+        ELSE IF (wantsFillLike(m) OR wantsCheck(m)) AND NOT (cmdDevice(m) AND cmdDate(m)) THEN {
+            bfSend('Понял, что нужно ' + (IF wantsFillLike(m) THEN 'заполнить данные' ELSE 'проверить данные')
+                 + ', но не хватает: ' + (IF NOT cmdDevice(m) THEN 'номера датчика' ELSE '')
+                 + (IF NOT cmdDevice(m) AND NOT cmdDate(m) THEN ' и ' ELSE '')
+                 + (IF NOT cmdDate(m) THEN 'даты' ELSE '')
+                 + '. Напишите так: «дозаполни датчик 004 за 23.07.2026 с 6 до 10».', '');
+            processedCmd(m) <- TRUE;
+        }
+    }
+}
+WHEN SET(Messenger.Message m IS Messenger.Message) DO processCmdMsg(m);
+
+// ================= Ни одно сообщение не остаётся без ответа =================
+// Обработчики выше срабатывают в транзакции вебхука и каждый помечает «своё» сообщение. Всё, что
+// никто не разобрал, догоняет этот воркер: отвечает, что не понял, и подсказывает формулировку.
+// Почему воркером, а не ещё одним WHEN SET: порядок срабатывания событий в одной транзакции не
+// гарантирован — из события мы не знаем, разберёт ли сообщение кто-то другой.
+answeredUnknown 'Отвечено (не понял)' = DATA BOOLEAN (Messenger.Message);
+// хук для модулей, которые грузятся ПОЗЖЕ (MachineBot со своими ответами про рейсы):
+// ссылаться на них отсюда напрямую нельзя, поэтому они сами дописываются в этот ABSTRACT.
+handledElsewhere = ABSTRACT BOOLEAN (Messenger.Message);
+handledMsg (Messenger.Message m) = processedCmd(m) OR processedBf(m) OR handledElsewhere(m) OR answeredUnknown(m);
+// «ок / спасибо / понял» — это подтверждение, а не команда: отвечаем коротко, без подсказки.
+isAckMsg (Messenger.Message m) = posOf(bfLower(m), 'ок') > 0 OR posOf(bfLower(m), 'спасиб') > 0
+    OR posOf(bfLower(m), 'понял') > 0 OR posOf(bfLower(m), 'хорошо') > 0 OR posOf(bfLower(m), 'принял') > 0;
+
+bfHelpText () = 'Не понял команду. Вот как написать, чтобы я понял:
+• проверь датчик 004 за 23.07.2026
+• дозаполни датчик 004 за 23.07.2026 с 6 до 10 с колебаниями
+• откорректируй датчик 004 за вчера, диапазон 4-6
+• проверь все датчики за прошлые сутки
+Датчик — три цифры номера, дата — ДД.ММ.ГГГГ либо «сегодня/вчера/позавчера». Если нужно другое — напишите словами, я уточню.';
+
+bfReplyWorker 'Дозаполнение: ответить на неразобранные' () {
+    // 40 секунд форы обработчикам вебхука, чтобы не перебить их ответ своим «не понял»
+    FOR Messenger.Message m IS Messenger.Message AND NOT handledMsg(m)
+        AND Messenger.from(m) != 'YOU'
+        AND Messenger.account(Messenger.chat(m)) = bfAccount()
+        AND bfAllowed(Messenger.from(m))
+        AND Messenger.dateTime(m) < subtractSeconds(currentDateTime(), 40)
+        AND DATE(Messenger.dateTime(m)) >= sum(currentDate(), -1) DO {
+        bfSend((IF isAckMsg(m) THEN 'Принято, спасибо.' ELSE bfHelpText()), '');
+        answeredUnknown(m) <- TRUE;
+        APPLY;
+    }
+}
+
+// ================= Воркер: тяжёлая работа вне события (своя сессия, APPLY разрешён) =================
+bfWorker 'Дозаполнение: обработка одобренных' () {
+    FOR BackfillRequest r IS BackfillRequest AND stage(r) = 'approved' AND NOT deviceUnderVerification(device(r)) DO {
+        generateBackfill(r);   // сам ставит stage 'generated' + APPLY
+        stage(r) <- 'checking';
+        APPLY;
+        bfSend('Датчик ' + nameDevice(r) + ': дозаполнил за период. Проверь на графике monitoring.mite.club. Ответьте: ок или переделать', '');
+    }
+    FOR BackfillRequest r2 IS BackfillRequest AND stage(r2) = 'redo' DO {
+        // границы — прямо по dateTime (индекс). NB: верхняя строгая (selToEx = < toSec), в отличие от <= toSec
+        // в генерации — прежнее расхождение сохранено как было, см. замечание в отчёте
+        FOR device(Measurement mm) = device(r2) AND dateTime(mm) >= selFrom(r2) AND dateTime(mm) < selToEx(r2) DO DELETE mm;
+        APPLY;
+        generateBackfill(r2);
+        stage(r2) <- 'checking';
+        APPLY;
+        bfSend('Перегенерил датчик ' + nameDevice(r2) + '. Проверь ещё раз. Ответьте: ок или переделать', '');
+    }
+}
+
+// ===== Регистрация заданий планировщика (по образцу MachineBot.botSetupSchedule) =====
+// Привязка действия — по КАНОНИЧЕСКОМУ имени 'Namespace.action[]' (надёжнее, чем script).
+// Создаём только если задания ещё нет. ВАЖНО: если задание уже создано с непривязанным действием,
+// код его больше не трогает (guard IF NOT) — чинится только удалением задания + перезапуском сервера,
+// при старте оно создастся заново уже с привязкой.
+bfSetupSchedule () {
+    // 12:00 — проверить вчерашние сутки и спросить в ТГ
+    IF NOT scheduledTask('Дозаполнение: проверка 12:00') THEN {
+        createScheduledTask('Дозаполнение: проверка 12:00', dateTimeToDateTime(currentDate(), 12:00), 86400, SchedulerStartType.afterStart);
+        createScheduledTaskDetail('Дозаполнение: проверка 12:00', 1, 'BackfillBot.backfillDailyCheck[]');
+    }
+    // раз в 5 мин — догенерить одобренные/переделать (генерация вне вебхук-транзакции)
+    IF NOT scheduledTask('Дозаполнение: воркер') THEN {
+        createScheduledTask('Дозаполнение: воркер', dateTimeToDateTime(currentDate(), 00:00), 300, SchedulerStartType.afterStart);
+        createScheduledTaskDetail('Дозаполнение: воркер', 1, 'BackfillBot.bfWorker[]');
+    }
+    // раз в минуту — ответить на всё, что не разобрали обработчики (ни одно сообщение без ответа)
+    IF NOT scheduledTask('Дозаполнение: ответчик') THEN {
+        createScheduledTask('Дозаполнение: ответчик', dateTimeToDateTime(currentDate(), 00:00), 60, SchedulerStartType.afterStart);
+        createScheduledTaskDetail('Дозаполнение: ответчик', 1, 'BackfillBot.bfReplyWorker[]');
+    }
+    APPLY;
+}
+onStarted() + { bfSetupSchedule(); }
+
+// Навигатор: одна папка в «Справочниках» (не в корне) — белый список + лог заявок
+NAVIGATOR {
+    masterData {
+        NEW FOLDER bfFolder 'Дозаполнение (бот)' {
+            NEW bfSenders;
+            NEW backfillRequests;
+        }
+    }
+}
+

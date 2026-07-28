@@ -1,0 +1,40 @@
+MODULE OrgLocation;
+
+REQUIRE Location, Organization, OrgUser;
+
+NAMESPACE Location;
+
+organization 'Организация' = DATA Organization (Location) AUTOSET ;
+organization 'Организация' = DATA Organization (Area) AUTOSET ;
+
+@addOrganization(locations, l);
+
+EXTEND FORM locations
+    FILTERS organization(a) = o
+    FILTERS organization(lg) = o
+;
+
+CONSTRAINT organization(parent(Location l)) != organization(l) CHECKED BY parent[Location] MESSAGE 'У вложенных точек размещения должны совпадать организации';
+
+selected 'Выбр.' = DATA LOCAL BOOLEAN (Location) CHANGEKEY 'ADD' CHANGEMOUSE 'CTRL CLK';
+FORM selectLocations 'Выбор точек размещения'
+    OBJECTS l = Location
+    PROPERTIES (l) selected, name READONLY
+;
+selectedLocations 'Точки размещения' = GROUP CONCAT name(Location l) IF selected(l),',' ORDER l;
+hasSelectedLocations = GROUP MAX selected(Location l);
+
+META addLocation(form, object)
+    EXTEND FORM form
+        PROPERTIES selectedLocations() ON CHANGE { DIALOG selectLocations FILTERS organization(l) = o; }
+        FILTERS NOT hasSelectedLocations() OR selected(location(object))
+    ;
+    DESIGN form {
+        paramBox {
+            NEW filters {
+                caption = 'Фильтры';
+                MOVE PROPERTY (selectedLocations());                
+            } 
+        }
+    }
+END

@@ -1,0 +1,81 @@
+MODULE Options;
+
+REQUIRE Utils;
+
+/// Логотип
+imageLogo 'Файл изображения логотипа '  = DATA IMAGEFILE ();
+EXTEND FORM options
+    PROPERTIES() imageLogo
+;
+///
+
+// Отдельные опции необходимые для настройки и работы приложения
+grafanaLogin 'Логин администратора Grafana' = DATA STRING[20]();
+grafanaPwd   'Пароль администратора Grafana' = DATA STRING[20]();
+grafanaUrl   'Базовый URL для Grafana' = DATA STRING[100]();
+
+grafanaApiURL = '${grafanaUrl()}/api';
+fillGrafanaAuth() {
+    encodeBase64(grafanaLogin() + ':' + grafanaPwd());
+    headers('Authorization') <- 'Basic ' + encodedBase64();
+}
+fillGrafanaOrgAndAuth(INTEGER orgId) {
+    fillGrafanaAuth();
+    headers('X-Grafana-Org-Id') <- STRING(orgId);
+//    EXTERNAL HTTP POST '${grafanaApiURL()}/user/using/${orgId}' HEADERS headers;
+}
+
+
+grafanaPsUrl    'URL для доступа к PostgreSQL' = DATA STRING[100](); 
+grafanaPsDB     'Имя БД PostgreSQL' = DATA STRING[50](); 
+grafanaPsLogin  'Логин к PostgreSQL' = DATA STRING[20](); 
+grafanaPsPwd    'Пароль к PostgreSQL' = DATA STRING[20](); 
+grafanaPsSSL    'SSL mode' = DATA STRING[15](); 
+
+EXTEND FORM options PROPERTIES() grafanaLogin;
+EXTEND FORM options PROPERTIES() grafanaPwd;
+EXTEND FORM options PROPERTIES() grafanaUrl;
+
+EXTEND FORM options PROPERTIES() grafanaPsUrl;
+EXTEND FORM options PROPERTIES() grafanaPsDB;
+EXTEND FORM options PROPERTIES() grafanaPsLogin;
+EXTEND FORM options PROPERTIES() grafanaPsPwd;
+EXTEND FORM options PROPERTIES() grafanaPsSSL;
+
+DESIGN options {
+    pane {
+        NEW h2 {
+            caption = 'Grafana: доступ'; 
+            horizontal = FALSE;
+            MOVE PROPERTY(grafanaLogin());
+            MOVE PROPERTY(grafanaPwd());
+            MOVE PROPERTY(grafanaUrl());
+        }
+        NEW h3 AFTER h2 {
+            caption = 'Grafana: доступ к PostgreSQL'; 
+            horizontal = FALSE;
+            MOVE PROPERTY(grafanaPsUrl());
+            MOVE PROPERTY(grafanaPsDB());
+            MOVE PROPERTY(grafanaPsLogin());
+            MOVE PROPERTY(grafanaPsPwd());
+            MOVE PROPERTY(grafanaPsSSL());
+        }
+    }
+}
+
+mqttPrnConsole  'Печать отладочной информации MQTT в консоль (0 или 1)' = DATA INTEGER ();  
+udpPrnConsole   'Печать отладочной информации UDP в консоль (0 или 1)' = DATA INTEGER ();
+
+EXTEND FORM options PROPERTIES() udpPrnConsole;
+EXTEND FORM options PROPERTIES() mqttPrnConsole;
+
+DESIGN options {
+    pane {
+        NEW h4 AFTER h3 {
+            caption = 'Отладка'; 
+            horizontal = FALSE;
+            MOVE PROPERTY(udpPrnConsole());
+            MOVE PROPERTY(mqttPrnConsole());
+        }
+    }
+}

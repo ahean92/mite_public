@@ -1,0 +1,123 @@
+MODULE Server;
+
+REQUIRE Device, SystemEvents, Measurement, Options, Organization, OrgDevice, 
+        MqttServer, Controller, OrgController;
+
+CLASS Server 'Сервер';
+name 'Наименование сервера' =  DATA STRING[100] (Server) CHARWIDTH 70;
+port 'Порт' = DATA INTEGER (Server);
+tcp 'TCP' = DATA BOOLEAN (Server);
+qps 'Кол-во пакетов для записи' = DATA INTEGER (Server);  // кол-во пакетов перед записью
+threads 'Кол-во потоков' = DATA INTEGER (Server);  // кол-во пакетов перед записью
+maxDelay 'Макс. задержка' = DATA INTEGER (Server);  // кол-во пакетов перед записью
+isRunning 'Запущен' = DATA BOOLEAN (Server);
+
+writeSimID(LONG l, STRING simID) ABSTRACT;
+
+startUDPServer INTERNAL 'mite.StartUDPServerAction' (Server, INTEGER, TEXT);
+stopUDPServer INTERNAL 'mite.StopUDPServerAction' (Server);
+
+startServer 'Запустить сервер' (Server server) {    
+    APPLY isRunning(server) <- TRUE;
+    
+    startUDPServer(server, port(server), 'importCSV');
+}
+stopServer 'Остановить сервер' (Server server) {
+    stopUDPServer(server);
+
+    APPLY isRunning(server) <- NULL;
+}
+
+server = DATA Server (Measurement);
+
+FORM servers 'Сервера UDP / TCP' 
+    OBJECTS s = Server
+    PROPERTIES (s) name, qps, threads, tcp, port, maxDelay, NEW, DELETE
+    PROPERTIES (s) TOOLBAR startServer SHOWIF NOT isRunning(s), stopServer SHOWIF isRunning(s)
+    
+//    OBJECTS (m = Measurement, mt = MeasurementType)
+//    PROPERTIES (m) dateTime READONLY 
+//    PROPERTIES 'ИД'=(OVERRIDE deviceId(m)+'', idImport(m) + '(не найдено)') READONLY
+//    PROPERTIES value(m, mt) READONLY 
+//    ORDERS dateTime(m) DESC
+//    FILTERS server(m) = s  
+;
+
+NAVIGATOR {
+    servers {
+        NEW servers;
+        NEW mqttServers;
+    }
+}
+
+// Автоматический старт обработчиков серверов UDP
+onStarted() + {
+    FOR isRunning(Server s) DO {
+        startUDPServer(s, port(s), 'importCSV');
+    }
+}
+
+// IMPORT
+
+importAdjustmentValue 'Значение корр.' = DATA DOUBLE (Device, MeasurementType);
+importAdjustmentOperand 'Операнд корр.' = DATA STRING[1] (DeviceType, MeasurementType);
+overAdjustmentValue 'Значение корр.' (Device d, MeasurementType mt) = OVERRIDE importAdjustmentValue(d, mt), (IF importAdjustmentOperand(type(d), mt) = '/' OR importAdjustmentOperand(type(d), mt) = '*' THEN 1.0 ELSE (0.0 IF importAdjustmentOperand(type(d), mt))) MATERIALIZED;
+adjustment (DeviceType type) = GROUP SUM 1 IF importAdjustmentOperand(type, MeasurementType mt);
+defaultImportAdjustmentValue 'Значение корр. (по умолч.)' (DeviceType dt, MeasurementType mt) = IF importAdjustmentOperand(dt, mt) = '/' OR importAdjustmentOperand(dt, mt) = '*' THEN '1.0' ELSE '0.0';  
+
+fieldImport(n, DeviceType dt, MeasurementType mt) = 'field' + (n IF n=number(dt, mt));
+fieldImportValue(n, DeviceType dt, MeasurementType mt) = 'field' + (n IF n=number(dt, mt)); // +  
+//                                                        (OVERRIDE (importAdjustmentOperand(dt, mt) + 'overAdjustmentValue(dv, mt)'),'');
+
+importCSVScript 'Скрипт импорта' (DeviceType dt) = 'run(Server server, CSVFILE file) \{\n'+
+                                                '\t'+  'IMPORT CSV NOHEADER FROM file FIELDS ZDATETIME dt, LONG id' + (OVERRIDE (GROUP CONCAT ', DOUBLE '+fieldImport(n, dt, MeasurementType mt), '' ORDER n),'') + ' DO \{\n' +
+                                                '\t\t'+       'FOR Device dv = device(id) AND NOT disableImport(dv) NEW m = Measurement DO \{\n' +
+                                                '\t\t\t'+            'dateTime(m) <- dt;\n' +
+                                                '\t\t\t'+            'device(m) <- dv;\n' +
+                                                '\t\t\t'+            'idImport(m) <- id;\n' +
+                                                '\t\t\t'+            'server(m) <- server;\n' +
+                                      (GROUP CONCAT '\t\t\t'+            'unAdjustedValue(m, MeasurementType mt) <- ' + fieldImportValue(n, dt, MeasurementType mt) + ' WHERE LONG(mt)=' + LONG(mt) + ';\n','' ORDER n) + 
+//                                      (OVERRIDE('\t\t\t'+            'unAdjustedValue(m, MeasurementType mt) <- CASE EXCLUSIVE' + (GROUP CONCAT ' WHEN LONG(mt)=' + LONG(MeasurementType mt) + ' THEN ' + fieldImportValue(n, dt, mt),'' ORDER n) + ';\n'),'') + 
+                                                '\t\t'+       '\}\n' + 
+                                                '\t'+  '\}\n' +
+                                                '\}\n' CHARWIDTH 5;
+
+
+copyMeasurementsFrom 'Копия датчика' = DATA Device (Device);
+idCopyMeasurementsFrom 'Копия датчика' (Device d) = id(copyMeasurementsFrom(d));
+WHEN SETCHANGED (device(Measurement m)) AND Device cp = copyMeasurementsFrom(device(m)) DO 
+    NEW cm = Measurement {
+        dateTime(cm) <- dateTime(m);
+        device(cm) <- cp;
+        idImport(cm) <- idImport(m);
+        server(cm) <- server(m);
+        unAdjustedValue(cm, MeasurementType mt) <- unAdjustedValue(m, mt);       
+    }
+
+EXTEND FORM deviceTypes
+//    PROPERTIES (t) importCSVScript
+    PROPERTIES (t, mt) importAdjustmentOperand
+    PROPERTIES (d) idCopyMeasurementsFrom
+;
+
+EXTEND FORM devices
+    PROPERTIES (d) idCopyMeasurementsFrom
+    PROPERTIES COLUMNS (cmt) importAdjustmentValue(d, cmt) HEADER 'Корр. : ' + name(cmt) SHOWIF importAdjustmentOperand(type(d), cmt), 
+                             adjv = value(m, cmt) HEADER name(cmt) + ' (raw)' SHOWIF importAdjustmentOperand(type(d), cmt) AND NOT hasDisplay(cmt)
+    PROPERTIES (m) SHOWIF adjustment(type(d)) dateraw 'Дата (raw)' = dateTime, NEW, DELETE GRID
+;
+
+importCSV(DeviceType dt, Server server, CSVFILE file) {
+    EVAL importCSVScript(dt) PARAMS server,  file;
+}
+
+// TEST
+importCSVTest(DeviceType dt) {
+    INPUT f = CSVFILE DO {
+        EXEC importCSV(dt, NULL, f) ;
+    }
+}
+EXTEND FORM deviceTypes
+    PROPERTIES importCSVTest(t) TOOLBAR;
+    
+    

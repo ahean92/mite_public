@@ -1,0 +1,136 @@
+MODULE Location;
+
+REQUIRE Controller, Device, Geo, Measurement, Hierarchy;
+
+CLASS Location 'Точка размещения' : POI;
+name 'Название' = DATA STRING (Location) NONULL IN id;
+address 'Адрес' = DATA ISTRING (Location) IN id;
+latitude 'Широта' = DATA NUMERIC[13,8] (Location) IN id;
+longitude 'Долгота' = DATA NUMERIC[13,8] (Location) IN id;
+
+mainAddress(Location l) += ISTRING[150](address(l));
+latitude(Location l) += NUMERIC[11,6](latitude(l));
+longitude(Location l) += NUMERIC[11,6](longitude(l));
+
+@defineHierarchy(location);
+
+CLASS Attribute 'Атрибут';
+name 'Имя' = DATA STRING (Attribute);
+value 'Значение' = DATA DOUBLE (Location, Attribute);
+recValue 'Влож. значение' (Location l, Attribute a) = GROUP LAST value(Location il, a) ORDER level(l, il) MATERIALIZED;
+
+FORM locations 'Точки размещения'
+    OBJECTS l = Location
+    PROPERTIES(l) name, address, latitude = latitude, longitude = longitude, popupName = name PANEL, calculateCoordinates GRID, NEW, DELETE, nameParent
+
+    OBJECTS cat = Attribute
+    PROPERTIES COLUMNS (cat) value(l, cat) HEADER name(cat), recValue(l, cat) HEADER name(cat) + ' (влож.) '
+    
+    TREE gl lg = Location PARENT parent(lg)
+    PROPERTIES(lg) name, address
+    
+    OBJECTS at = Attribute
+    PROPERTIES (at) name, NEW, DELETE
+;
+
+DESIGN locations {
+    GRID(l) {
+        NEW popup {
+            MOVE PROPERTY (popupName);
+        }
+    }
+    OBJECTS {
+        NEW top {
+            horizontal = FALSE;
+            NEW tab {
+                tabbed = TRUE;
+                fill = 1;
+                
+                NEW tabl {
+                    caption = 'Точки размещения';
+                    tabbed = TRUE;
+                    MOVE BOX(l) {
+                        caption = 'Список';
+                    }
+                    MOVE BOX(TREE gl) {
+                        caption = 'Дерево';
+                    }                    
+                    fill = 1;
+                }
+                MOVE BOX(at) {
+                    caption = 'Атрибуты размещения';
+                }
+            }
+            fill = 1;
+        }
+    }
+}
+
+NAVIGATOR {
+    equipment {
+        NEW FOLDER location 'Расположение' {
+            NEW locations;
+        }
+    }
+}
+
+location = DATA Location (Controller);
+nameLocation 'Точка размещения' = name(location(Controller c));
+EXTEND FORM controllers
+    PROPERTIES (c) nameLocation
+;
+
+latitudeType = GROUP AGGR MeasurementType type WHERE name(type) = 'Широта';
+longitudeType = GROUP AGGR MeasurementType type WHERE name(type) = 'Долгота';
+locationType = GROUP AGGR MeasurementType type WHERE name(type) = 'Точка размещения';
+
+location = ABSTRACT Location (Measurement);
+location = DATA Location (Device);
+
+latitude 'Широта' (Measurement m) = OVERRIDE value(m, latitudeType()), latitude(location(m));
+longitude 'Долгота' (Measurement m) = OVERRIDE value(m, longitudeType()), longitude(location(m));
+
+latitude 'Широта' (Device d) = OVERRIDE latitude(lastMeasurement(d)), latitude(location(d)) MATERIALIZED;
+longitude 'Долгота' (Device d) = OVERRIDE longitude(lastMeasurement(d)), longitude(location(d)) MATERIALIZED;
+nameLocation 'Точка размещения (по умолч.)' = name(location(Device d));
+
+EXTEND FORM devices
+    PROPERTIES (d) nameLocation, latitude = latitude, longitude = longitude
+;
+
+CLASS Area 'Область размещения';
+name 'Имя' = DATA STRING (Area) IN id;
+
+CLASS AreaPolygon 'Полигон';
+area = DATA Area (AreaPolygon);
+coordinates 'Координаты' = DATA STRING (AreaPolygon);
+coordinates(AreaPolygon a) <- '53.84684032429679 27.561952658741678,53.92699222038149 27.641596092859622,53.91728609378836 27.4658280611572' WHEN SET (a IS AreaPolygon); // minsk
+
+isIn(DOUBLE latitude, DOUBLE longitude, Area area) = GROUP SUM 1 IF isPointInPolygon(latitude, longitude, coordinates(AreaPolygon ap)) BY area(ap);
+isIn(Device d, Area area) = isIn(latitude(d), longitude(d), area);
+
+EXTEND FORM locations
+    OBJECTS a = Area
+    PROPERTIES(a) name, NEW, DELETE
+    
+    OBJECTS av = AreaPolygon
+    PROPERTIES (av) polygon = coordinates, NEW, DELETE
+    FILTERS area(av) = a
+;
+
+DESIGN locations {
+    tab {
+        NEW areas {
+            horizontal = FALSE;
+            caption = 'Области размещения';
+            
+            MOVE BOX(a) {
+                fill = 1;
+            }
+            MOVE BOX(av) {
+                fill = 2;
+            }        
+        }
+    }
+}
+

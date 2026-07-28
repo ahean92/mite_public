@@ -1,0 +1,65 @@
+MODULE ControllerDevice;
+
+REQUIRE Controller, Command;
+
+///// TYPES /////
+
+CLASS ControllerDeviceType 'Тип устройств';
+controllerType = DATA ControllerType (ControllerDeviceType);
+name 'Название' = DATA STRING (ControllerDeviceType) IN id;
+
+on = DATA Command (ControllerDeviceType);
+CONSTRAINT controllerType(on(ControllerDeviceType t)) != controllerType(t) CHECKED BY on MESSAGE 'Команда включения должна соответствовать типу контроллера';
+off = DATA Command (ControllerDeviceType);
+CONSTRAINT controllerType(off(ControllerDeviceType t)) != controllerType(t) CHECKED BY off MESSAGE 'Команда выключения должна соответствовать типу контроллера';
+nameOn 'Команда вкл.' (ControllerDeviceType t) = name(on(t));
+nameOff 'Команда выкл.' (ControllerDeviceType t) = name(off(t));
+
+EXTEND FORM controllerTypes
+    OBJECTS cdt = ControllerDeviceType
+    PROPERTIES (cdt) name, nameOn, nameOff, NEW, DELETE
+    FILTERS controllerType(cdt) = t
+;
+
+DESIGN controllerTypes {
+    tab {
+        MOVE BOX (cdt) {
+            caption = 'Типы устройств';
+        }
+    }    
+}
+
+///// INSTANCES /////
+
+CLASS ControllerDevice 'Устройство';
+controllerDevice(Controller controller, ControllerDeviceType type) = AGGR ControllerDevice WHERE type(controller) = controllerType(type);
+
+name 'Название' (ControllerDevice cd) = name(type(cd)) IN id;
+idController 'ID контр.' (ControllerDevice cd) = id(controller(cd)) IN id; 
+
+on = on(type(ControllerDevice c));
+off = off(type(ControllerDevice c));
+nameOn 'Команда вкл.' (ControllerDevice t) = name(on(t));
+nameOff 'Команда выкл.' (ControllerDevice t) = name(off(t));
+
+runOn(ControllerDevice c) {
+    transmitControlSignal(on(c), controller(c));
+} 
+runOff(ControllerDevice c) {
+    transmitControlSignal(off(c), controller(c));
+}
+
+EXTEND FORM controllers
+    OBJECTS cd = ControllerDevice
+    PROPERTIES (cd) idController, name
+    FILTERS controller(cd) = c
+;
+
+DESIGN controllers {
+    tab {
+        tabbed = TRUE;
+        MOVE BOX (cd) {
+            caption = 'Устройства';
+        }
+    }
+}

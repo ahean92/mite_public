@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <repositories>
+        <repository>
+            <id>lsfusion</id>
+            <name>lsFusion Public Repository</name>
+            <url>https://repo.lsfusion.org</url>
+        </repository>
+    </repositories>
+
+    <parent>
+        <groupId>lsfusion.platform.build</groupId>
+        <artifactId>logics</artifactId>
+        <version>7.0-SNAPSHOT</version>
+        <relativePath>../platform/build/logics/pom.xml</relativePath>
+    </parent>
+
+ <dependencies>
+        <dependency>
+            <groupId>com.googlecode.json-simple</groupId>
+            <artifactId>json-simple</artifactId>
+            <version>1.1.1</version>
+        </dependency>
+       <dependency>
+          <groupId>org.eclipse.paho</groupId>
+          <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
+          <version>1.2.1</version>
+      </dependency>
+     <!-- https://mvnrepository.com/artifact/com.intelligt.modbus/jlibmodbus -->
+     <dependency>
+         <groupId>com.intelligt.modbus</groupId>
+         <artifactId>jlibmodbus</artifactId>
+         <version>1.2.9.4</version>
+     </dependency>
+     <!-- https://mvnrepository.com/artifact/net.solarnetwork.common/nifty-modbus-core -->
+     <dependency>
+         <groupId>net.solarnetwork.common</groupId>
+         <artifactId>nifty-modbus-core</artifactId>
+         <version>0.4.0</version>
+     </dependency>
+     <!-- https://mvnrepository.com/artifact/net.solarnetwork.common/nifty-modbus-tcp -->
+     <dependency>
+         <groupId>net.solarnetwork.common</groupId>
+         <artifactId>nifty-modbus-tcp</artifactId>
+         <version>0.4.0</version>
+     </dependency>
+     <dependency>
+         <groupId>org.apache.httpcomponents</groupId>
+         <artifactId>httpmime</artifactId>
+         <version>4.5.7</version>
+    </dependency>
+     <dependency>
+         <groupId>commons-codec</groupId>
+         <artifactId>commons-codec</artifactId>
+         <version>1.13</version>
+     </dependency>
+     <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpclient</artifactId>
+        <version>4.5.7</version>
+    </dependency>
+    <!--Приходится подключать, так как возникает какая-то вилка с зависимостями из silvertunnel-->
+    <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpclient-android</artifactId>
+        <version>4.3.5.1</version>
+    </dependency>
+     <dependency>
+         <groupId>com.digitalpetri.modbus</groupId>
+         <artifactId>modbus-master-tcp</artifactId>
+         <version>1.2.0</version>
+     </dependency>
+     <dependency>
+         <groupId>org.apache.commons</groupId>
+         <artifactId>commons-math3</artifactId>
+         <version>3.6.1</version>
+     </dependency>
+ </dependencies>
+
+    <groupId>com.mite</groupId>
+    <artifactId>iot</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+
+</project>
