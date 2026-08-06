@@ -1,0 +1,137 @@
+MODULE StoreTaskMite;
+
+REQUIRE StoreTaskLib, Authentication, SystemEvents,
+        Device, Location, OrgDevice, OrgUser, ManagementReport;
+
+NAMESPACE StoreTask;
+
+// Хост-пакет mite для подсистемы задач (тикет 31): исполнитель, мост приборов,
+// права по организациям и сид шаблона аварии.
+
+// ===== 31.3 Исполнитель: сотрудник (Employee из management/ManagementReport) =====
+// Единый справочник людей: те же сотрудники, что в актах обработки инцидентов
+// (responsible/approver/registrant у ManagerLog), назначаются на задачи. Для входа
+// с мобильного сотрудник связывается с учётной записью; сотрудник без учётки —
+// валидный исполнитель (виден в истории и актах, но не логинится).
+EXTEND CLASS Employee : TaskPerformer;
+
+user 'Учётная запись' = DATA CustomUser (Employee);
+employee = GROUP AGGR Employee e BY user(e);
+loginUser 'Логин' (Employee e) = login(user(e));
+
+organization 'Организация' = DATA Organization (Employee);
+nameOrganization 'Организация' (Employee e) = name(organization(e));
+dismissed 'В архиве' = DATA BOOLEAN (Employee);
+
+id (Employee e) += ISTRING[100](OVERRIDE login(user(e)), 'emp-' + LONG(e));
+StoreTask.name (Employee e) += ISTRING[100](ManagementReport.name(e));
+archived (Employee e) += dismissed(e);
+in (Employee p, User u) += p = employee(u AS CustomUser);
+
+performer (CustomUser u) += employee(u);
+
+// справочник сотрудников (у mite-овского Employee своей формы не было)
+changeUser (Employee e) {
+    DIALOG customUsersDialog OBJECTS u = user(e) INPUT NULL DO user(e) <- u;
+}
+
+FORM employees 'Сотрудники'
+    OBJECTS e = Employee
+    PROPERTIES(e) name, position, nameOrganization, loginUser ON CHANGE changeUser(e), dismissed
+    PROPERTIES(e) NEW, DELETE
+
+    FILTERGROUP active
+        FILTER 'Действующие' NOT dismissed(e) DEFAULT
+;
+
+NAVIGATOR {
+    data {
+        NEW employees AFTER organizationUsers;
+    }
+}
+
+// ===== 31.2 Мост приборов: датчик MITE — объект проверки =====
+EXTEND CLASS Device : CheckObject;
+
+// StoreTask.name — явно: у Device есть и второй абстрактный name (ControllerManagement)
+StoreTask.name (Device d) += ISTRING[150](CONCAT ' ', nameType(d), '№' + id(d));
+address (Device d) += ISTRING[250](Location.name(location(d)));
+
+// ===== Права: организация задачи выводится из её прибора, не хранится.
+// Орг-пользователь видит и назначает только в рамках своей организации;
+// пользователи без организации (глобальные) не ограничены.
+EXTEND FORM tasks
+    FILTERS NOT organization(checkObject(t) AS Device) != organization(currentUser())
+;
+EXTEND FORM checkObjects
+    FILTERS NOT organization(o AS Device) != organization(currentUser())
+;
+EXTEND FORM taskPerformers
+    FILTERS NOT organization(p AS Employee) != organization(currentUser())
+;
+
+CONSTRAINT organization(assignedTo(Task t) AS Employee) != organization(checkObject(t) AS Device)
+    CHECKED BY assignedTo[Task]
+    MESSAGE 'Исполнитель и прибор задачи принадлежат разным организациям';
+
+// Орг-роли mite (fillDefaultAccess) запрещают весь навигатор через forbid System.root —
+// дерево у орг-пользователя пустое, и веб-клиент падает на нём (NPE на null root).
+// Разрешаем орг-ролям ветку задач: исполнитель видит «Задачи магазинов», дерево непустое.
+// Ближайший permit перебивает унаследованный от корня forbid; ручные настройки не трогаем.
+permitStoreTaskFolder (UserRole r) {
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) THEN
+        dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) <- Permission.permit;
+}
+
+onStarted() + {
+    permitStoreTaskFolder(userRoleSID('orgadmin'));
+    permitStoreTaskFolder(userRoleSID('orguser'));
+}
+
+// ===== 31.4 Сид шаблона «Авария: отклонение температуры» (идемпотентный) =====
+ensureEmergencyTemplate () {
+    NEWSESSION {
+        IF NOT taskType('form') THEN NEW tt = TaskType { name(tt) <- 'Процедура'; id(tt) <- 'form'; }
+        APPLY;
+    }
+    NEWSESSION {
+        IF NOT optionSetByName('Причины отклонения температуры') THEN NEW os = OptionSet {
+            name(os) <- 'Причины отклонения температуры';
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'door_open'; name(o) <- 'Открыта дверь/крышка'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'equipment'; name(o) <- 'Сбой холодильного оборудования'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'power'; name(o) <- 'Отключение электропитания'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'sensor'; name(o) <- 'Неисправность датчика'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'loading'; name(o) <- 'Загрузка/выгрузка товара'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'other'; name(o) <- 'Другое'; }
+        }
+        APPLY;
+    }
+    NEWSESSION {
+        IF NOT templateByName('Авария: отклонение температуры') THEN NEW tpl = Template {
+            name(tpl) <- 'Авария: отклонение температуры';
+            note(tpl) <- 'Выезд по инциденту телеметрии MITE';
+            resolutionRequired(tpl) <- TRUE;
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Прибор';
+                NEW f = Field { section(f) <- s; code(f) <- 'qr'; name(f) <- 'QR-код прибора'; type(f) <- FieldType.scan; required(f) <- TRUE; }
+            }
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Температура';
+                NEW f = Field { section(f) <- s; code(f) <- 'temp_mite'; name(f) <- 'Температура по MITE'; type(f) <- FieldType.number; unit(f) <- '°C'; }
+                NEW f = Field { section(f) <- s; code(f) <- 'temp_local'; name(f) <- 'Температура на месте'; type(f) <- FieldType.number; unit(f) <- '°C';
+                                minNorm(f) <- 2.0; maxNorm(f) <- 8.0; required(f) <- TRUE; requirePhoto(f) <- TRUE; hint(f) <- 'Норма 2–8 °C; при отклонении — фото'; }
+            }
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Причина и действия';
+                NEW f = Field { section(f) <- s; code(f) <- 'cause'; name(f) <- 'Причина отклонения'; type(f) <- FieldType.choice;
+                                optionSet(f) <- optionSetByName('Причины отклонения температуры'); required(f) <- TRUE; }
+                NEW f = Field { section(f) <- s; code(f) <- 'fixed_on_site'; name(f) <- 'Устранено на месте'; type(f) <- FieldType.boolean; required(f) <- TRUE; }
+                NEW f = Field { section(f) <- s; code(f) <- 'photo_device'; name(f) <- 'Фото прибора'; type(f) <- FieldType.photo; required(f) <- TRUE; }
+                NEW f = Field { section(f) <- s; code(f) <- 'writeoff_kg'; name(f) <- 'Списание, кг'; type(f) <- FieldType.number; unit(f) <- 'кг'; }
+            }
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Итог';
+                NEW f = Field { section(f) <- s; code(f) <- 'comment'; name(f) <- 'Комментарий'; type(f) <- FieldType.longtext; }
+            }
+        }
+        APPLY;
+    }
+}
+
+onStarted() + { ensureEmergencyTemplate(); }

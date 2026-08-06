@@ -1,0 +1,189 @@
+MODULE MiteTestData;
+
+REQUIRE Measurement, OrgDevice, OrgLocation, OrgUser, StoreTaskMite, DefaultData, Authentication;
+
+// Генератор тестовых данных для пустой базы: организация с пользователями, точки
+// размещения, датчики с суточной историей измерений и задачи на приборы.
+// Сознательно не зависит от модуля Mite (иначе цикл: Mite подключает генератор) —
+// поэтому типы измерений ищутся по имени локально, а mite-специфика вроде
+// ID контейнера и флага «машина» у точки не заполняется.
+
+// имена — ровно те, по которым Mite ищет temperatureType() и др.
+demoTemperatureType = GROUP MAX MeasurementType mt IF name(mt) = 'Температура';
+demoHumidityType = GROUP MAX MeasurementType mt IF name(mt) = 'Влажность';
+demoBatteryType = GROUP MAX MeasurementType mt IF name(mt) = 'Батарея';
+
+generateDemoData 'Сгенерировать тестовые данные' () {
+
+    IF Organization.organization('Демо-организация') THEN {
+        MESSAGE 'Тестовые данные уже есть — «Демо-организация» найдена' NOWAIT;
+        RETURN;
+    }
+
+    // статусы/приоритеты/тип задач — если «Данные по умолчанию» ещё не загружали
+    NEWSESSION {
+        IF NOT taskStatus('new') THEN loadDefaultData();
+        APPLY;
+    }
+
+    // организация (все реквизиты NONULL)
+    NEWSESSION {
+        NEW o = Organization {
+            name(o) <- 'Демо-организация';
+            unn(o) <- '190000000';
+            address(o) <- 'г. Минск, ул. Демонстрационная, 1';
+            contact(o) <- 'Иванов И.И.';
+            phone(o) <- '+375 29 000-00-00';
+            site(o) <- 'demo.example.com';
+            email(o) <- 'demo@example.com';
+        }
+        APPLY;
+    }
+
+    // пользователи: администратор организации и два исполнителя
+    NEWSESSION {
+        FOR Organization o = Organization.organization('Демо-организация') DO {
+            NEW u = CustomUser {
+                login(u) <- 'demo.admin';
+                firstName(u) <- 'Дмитрий'; lastName(u) <- 'Демо-Админов';
+                organization(u) <- o;
+                in(u, userRoleSID('orgadmin')) <- TRUE;
+                setSHA256Password(u, 'demo');
+            }
+            NEW u = CustomUser {
+                login(u) <- 'demo.user1';
+                firstName(u) <- 'Пётр'; lastName(u) <- 'Выездной';
+                organization(u) <- o;
+                in(u, userRoleSID('orguser')) <- TRUE;
+                setSHA256Password(u, 'demo');
+            }
+            NEW u = CustomUser {
+                login(u) <- 'demo.user2';
+                firstName(u) <- 'Сергей'; lastName(u) <- 'Наладчиков';
+                organization(u) <- o;
+                in(u, userRoleSID('orguser')) <- TRUE;
+                setSHA256Password(u, 'demo');
+            }
+        }
+        APPLY;
+    }
+
+    // сотрудники-исполнители, связанные с учётками (исполнитель задач — Employee)
+    NEWSESSION {
+        FOR Organization o = Organization.organization('Демо-организация') DO {
+            NEW e = Employee {
+                name(e) <- 'Пётр Выездной';
+                position(e) <- 'Водитель-экспедитор';
+                organization(e) <- o;
+                user(e) <- customUserLowerLogin('demo.user1');
+            }
+            NEW e = Employee {
+                name(e) <- 'Сергей Наладчиков';
+                position(e) <- 'Инженер-наладчик';
+                organization(e) <- o;
+                user(e) <- customUserLowerLogin('demo.user2');
+            }
+        }
+        APPLY;
+    }
+
+    // типы измерений
+    NEWSESSION {
+        IF NOT demoTemperatureType() THEN NEW mt = MeasurementType { id(mt) <- 901; name(mt) <- 'Температура'; }
+        IF NOT demoHumidityType() THEN NEW mt = MeasurementType { id(mt) <- 902; name(mt) <- 'Влажность'; }
+        IF NOT demoBatteryType() THEN NEW mt = MeasurementType { id(mt) <- 903; name(mt) <- 'Батарея'; }
+        APPLY;
+    }
+
+    // тип датчика с раскладкой типов измерений
+    NEWSESSION {
+        NEW dt = DeviceType {
+            id(dt) <- 900;
+            name(dt) <- 'Термогигрометр (демо)';
+            number(dt, demoTemperatureType()) <- 1;
+            number(dt, demoHumidityType()) <- 2;
+            number(dt, demoBatteryType()) <- 3;
+        }
+        APPLY;
+    }
+
+    // точки размещения и датчики: склад с двумя, машина с одним
+    NEWSESSION {
+        FOR Organization o = Organization.organization('Демо-организация') DO {
+            NEW l = Location {
+                name(l) <- 'Склад (демо)';
+                organization(l) <- o;
+                NEW d = Device { id(d) <- 910001; type(d) <- (GROUP MAX DeviceType x IF id(x) = 900); location(d) <- l; organization(d) <- o; }
+                NEW d = Device { id(d) <- 910002; type(d) <- (GROUP MAX DeviceType x IF id(x) = 900); location(d) <- l; organization(d) <- o; }
+            }
+            NEW l = Location {
+                name(l) <- 'Машина 4750 (демо)';
+                organization(l) <- o;
+                NEW d = Device { id(d) <- 910003; type(d) <- (GROUP MAX DeviceType x IF id(x) = 900); location(d) <- l; organization(d) <- o; }
+            }
+        }
+        APPLY;
+    }
+
+    // измерения за последние сутки, шаг 30 минут; у датчика 910003 последние
+    // 3 часа температура выше нормы 2–8 °C — материал для сценария «авария»
+    NEWSESSION {
+        LOCAL tm = ZDATETIME ();
+        FOR Device d IS Device AND id(d) >= 910001 AND id(d) <= 910003 DO {
+            tm() <- sumSeconds(currentZDateTime(), -86400);
+            WHILE tm() <= currentZDateTime() DO {
+                NEW m = Measurement {
+                    device(m) <- d;
+                    dateTime(m) <- tm();
+                    value(m, demoTemperatureType()) <- 5.0 + (random() - 0.5) * 2;
+                    value(m, demoHumidityType()) <- 60.0 + (random() - 0.5) * 10;
+                    value(m, demoBatteryType()) <- 95.0 - random() * 10;
+                    IF id(d) = 910003 AND tm() >= sumSeconds(currentZDateTime(), -10800) THEN
+                        value(m, demoTemperatureType()) <- 9.5 + random();
+                }
+                tm() <- sumSeconds(tm(), 1800);
+            }
+        }
+        APPLY;
+    }
+
+    // задачи: открытая обычная, открытая аварийная по шаблону, закрытая
+    NEWSESSION {
+        NEW t = Task {
+            name(t) <- 'Осмотр датчика после поверки';
+            checkObject(t) <- device(910001);
+            type(t) <- taskType('form');
+            template(t) <- templateByName('Авария: отклонение температуры');
+            priority(t) <- GROUP MAX TaskPriority p IF id(p) = 'normal';
+            assignedTo(t) <- employee(customUserLowerLogin('demo.user1'));
+            deadline(t) <- sum(currentDate(), 2);
+            description(t) <- 'Демо-задача: плановый осмотр прибора на складе';
+        }
+        NEW t = Task {
+            name(t) <- 'Авария: отклонение температуры в контейнере 3';
+            checkObject(t) <- device(910003);
+            type(t) <- taskType('form');
+            template(t) <- templateByName('Авария: отклонение температуры');
+            priority(t) <- GROUP MAX TaskPriority p IF id(p) = 'high';
+            assignedTo(t) <- employee(customUserLowerLogin('demo.user2'));
+            deadline(t) <- currentDate();
+            description(t) <- 'Демо-задача: температура в контейнере 3 выше нормы, нужен выезд';
+        }
+        NEW t = Task {
+            name(t) <- 'Замена батареи (выполнена)';
+            checkObject(t) <- device(910002);
+            type(t) <- taskType('form');
+            status(t) <- taskStatus('done');
+            priority(t) <- GROUP MAX TaskPriority p IF id(p) = 'low';
+            assignedTo(t) <- employee(customUserLowerLogin('demo.user1'));
+            progress(t) <- 100;
+        }
+        APPLY;
+    }
+
+    MESSAGE 'Тестовые данные созданы.\n\nПользователи (пароль у всех: demo):\n  demo.admin — администратор организации\n  demo.user1 (Пётр Выездной), demo.user2 (Сергей Наладчиков) — сотрудники-исполнители\n\nДатчики 910001–910002 на складе, 910003 на машине (последние 3 часа — перегрев).\nЗадачи: 2 открытые (одна аварийная) и 1 закрытая.' NOWAIT;
+}
+
+EXTEND FORM organizations
+    PROPERTIES() generateDemoData DRAW o TOOLBAR
+;
