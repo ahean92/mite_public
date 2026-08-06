@@ -187,3 +187,28 @@ generateDemoData 'Сгенерировать тестовые данные' () {
 EXTEND FORM organizations
     PROPERTIES() generateDemoData DRAW o TOOLBAR
 ;
+
+// Ручная подача температуры со стенда: датчик выбирается на форме, значение — с
+// клавиатуры, время — текущее. Дальше всё как у боевого импорта: lastValue ->
+// условия управления -> isOn -> ManagerLog -> задача. Нужна, чтобы без живых
+// датчиков гонять сценарии «сработало / вернулось в норму / сработало снова».
+demoFeedTemperature 'Подать температуру (демо)' (Device d) {
+    IF NOT demoTemperatureType() THEN {
+        MESSAGE 'Нет типа измерения «Температура» — сначала нажмите «Сгенерировать тестовые данные»' NOWAIT;
+        RETURN;
+    }
+    INPUT v = DOUBLE DO {
+        NEWSESSION {
+            NEW m = Measurement {
+                device(m) <- d;
+                dateTime(m) <- currentZDateTime();
+                value(m, demoTemperatureType()) <- v;
+            }
+            APPLY;
+        }
+    }
+}
+
+EXTEND FORM devices
+    PROPERTIES (d) demoFeedTemperature TOOLBAR
+;

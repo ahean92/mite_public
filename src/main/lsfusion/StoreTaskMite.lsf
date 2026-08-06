@@ -89,6 +89,9 @@ onStarted() + {
 }
 
 // ===== 31.4 Сид шаблона «Авария: отклонение температуры» (идемпотентный) =====
+emergencyTemplateName () = ISTRING[150]('Авария: отклонение температуры');
+emergencyTemplate () = templateByName(emergencyTemplateName());
+
 ensureEmergencyTemplate () {
     NEWSESSION {
         IF NOT taskType('form') THEN NEW tt = TaskType { name(tt) <- 'Процедура'; id(tt) <- 'form'; }
@@ -107,8 +110,8 @@ ensureEmergencyTemplate () {
         APPLY;
     }
     NEWSESSION {
-        IF NOT templateByName('Авария: отклонение температуры') THEN NEW tpl = Template {
-            name(tpl) <- 'Авария: отклонение температуры';
+        IF NOT emergencyTemplate() THEN NEW tpl = Template {
+            name(tpl) <- emergencyTemplateName();
             note(tpl) <- 'Выезд по инциденту телеметрии MITE';
             resolutionRequired(tpl) <- TRUE;
             NEW s = Section { template(s) <- tpl; name(s) <- 'Прибор';
@@ -135,3 +138,91 @@ ensureEmergencyTemplate () {
 }
 
 onStarted() + { ensureEmergencyTemplate(); }
+
+// ===== 31.5 Правило «инцидент → задача» =====
+// Инцидент — ManagerLog со взведённым isOn (сработало условие управления). По нему
+// создаётся задача «Процедура» по шаблону аварии на прибор инцидента. Гейт тот же,
+// что у уведомлений: active = «Условие уведомления» + доменное подавление
+// (MachineBot «вне рейса»); пока уведомления подавлены — задачи нет.
+
+task 'Задача' = DATA Task (ManagerLog);
+incidentManager (Task t) = GROUP MAX manager(ManagerLog l) IF task(l) = t;
+// одна открытая задача на управление: повторные срабатывания цепляются к ней, дубли не создаются
+openIncidentTask (ControllerManager m) = GROUP LAST Task t ORDER t WHERE opened(t) AND incidentManager(t) = m;
+
+// прибор инцидента: устройство, на которое заведено управление по шаблону, иначе — датчик из условий
+incidentDevice (ControllerManager m) = OVERRIDE ControllerManagement.templateDevice(m),
+    (GROUP MAX Device d IF usedValue(m, d));
+incidentMeasurementType (ControllerManager m) = GROUP MAX MeasurementType mt IF used(m, incidentDevice(m), mt);
+
+// телеметрия на момент срабатывания: в задачу пишется снимок — текущее значение уйдёт,
+// а исполнитель должен видеть то, из-за чего случился выезд
+incidentValue (ControllerManager m) = lastValue(incidentDevice(m), incidentMeasurementType(m));
+incidentMin (ControllerManager m) = minValue(m, incidentDevice(m), incidentMeasurementType(m));
+incidentMax (ControllerManager m) = maxValue(m, incidentDevice(m), incidentMeasurementType(m));
+
+incidentValue 'Значение по MITE' = DATA DOUBLE (Task);
+incidentMin 'Порог, от' = DATA DOUBLE (Task);
+incidentMax 'Порог, до' = DATA DOUBLE (Task);
+
+priorityByDeviation (DeviationStatus s) = OVERRIDE
+    (taskPriority('urgent') IF s = DeviationStatus.critical),
+    (taskPriority('high') IF s = DeviationStatus.significant),
+    (taskPriority('low') IF s = DeviationStatus.insignificant);
+
+WHEN SET(ManagerLog l IS ManagerLog) AND isOn(l)
+        AND ControllerManagement.active(manager(l))
+        AND incidentDevice(manager(l)) DO {
+    IF openIncidentTask(manager(l)) THEN
+        task(l) <- openIncidentTask(manager(l));
+    ELSE
+        NEW t = Task {
+            type(t) <- formTaskType();
+            template(t) <- emergencyTemplate();
+            name(t) <- emergencyTemplateName();
+            checkObject(t) <- incidentDevice(manager(l));
+            priority(t) <- OVERRIDE priorityByDeviation(deviationStatus(l)), taskPriority('normal');
+            incidentValue(t) <- incidentValue(manager(l));
+            incidentMin(t) <- incidentMin(manager(l));
+            incidentMax(t) <- incidentMax(manager(l));
+            description(t) <- (CONCAT '\n',
+                'Инцидент MITE: ' + (CONCAT ', ', nameManager(l), toChar(dateTime(l), 'DD.MM.YYYY HH24:MI')),
+                (CONCAT ' ', name(incidentMeasurementType(manager(l))) + ':',
+                    STRING(incidentValue(manager(l))),
+                    '(порог ' + STRING(incidentMin(manager(l))) + ' – ' + STRING(incidentMax(manager(l))) + ')'));
+            task(l) <- t;
+        }
+}
+
+// оператор проставил статус отклонения — приоритет ещё открытой задачи следует за ним
+WHEN SETCHANGED(deviationStatus(ManagerLog l)) AND opened(task(l)) DO
+    priority(task(l)) <- OVERRIDE priorityByDeviation(deviationStatus(l)), taskPriority('normal');
+
+// исполнитель начал выезд — поле «Температура по MITE» предзаполняется снимком телеметрии
+WHEN SET(Filling f IS Filling) AND incidentValue(task(f)) DO
+    numberValue(f, field(template(f), 'temp_mite')) <- NUMERIC[14,4](incidentValue(task(f)));
+
+// ===== 31.6 Обратный ход: завершение выезда закрывает инцидент =====
+fixedOnSite (Filling f) = boolValue(f, field(template(f), 'fixed_on_site'));
+actionsText (Filling f) = (CONCAT '\n',
+    ('Устранено на месте: ' + (IF fixedOnSite(f) == TTRUE THEN 'да' ELSE 'нет')) IF fixedOnSite(f),
+    'Списание: ' + STRING(numberValue(f, field(template(f), 'writeoff_kg'))) + ' кг',
+    textValue(f, field(template(f), 'comment')));
+
+onFinish(Filling f) + {
+    FOR task(ManagerLog l) = task(f) DO {
+        proceeded(l) <- TRUE;
+        actionsDone(l) <- actionsText(f);
+        decision(l) <- caption(resolution(f));
+    }
+}
+
+// ===== 31.7 Задача в форме обработки инцидентов =====
+idTask 'Задача' (ManagerLog l) = id(task(l));
+nameStatusTask 'Статус задачи' (ManagerLog l) = nameStatus(task(l));
+showTask 'Открыть задачу' (ManagerLog l) { SHOW task OBJECTS t = task(l) DOCKED MANAGESESSION; }
+
+EXTEND FORM managerLogs
+    PROPERTIES (ml) READONLY idTask, nameStatusTask
+    PROPERTIES (ml) showTask TOOLBAR SHOWIF task(ml)
+;
