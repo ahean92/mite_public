@@ -76,7 +76,7 @@ CONSTRAINT organization(assignedTo(Task t) AS Employee) != organization(checkObj
 
 // Орг-роли mite (fillDefaultAccess) запрещают весь навигатор через forbid System.root —
 // дерево у орг-пользователя пустое, и веб-клиент падает на нём (NPE на null root).
-// Разрешаем орг-ролям ветку задач: исполнитель видит «Задачи магазинов», дерево непустое.
+// Разрешаем орг-ролям ветку задач: исполнитель видит «Управление персоналом», дерево непустое.
 // Ближайший permit перебивает унаследованный от корня forbid; ручные настройки не трогаем.
 permitStoreTaskFolder (UserRole r) {
     IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) THEN
