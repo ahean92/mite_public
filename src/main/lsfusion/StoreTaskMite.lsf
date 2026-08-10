@@ -53,9 +53,23 @@ NAVIGATOR {
 // ===== 31.2 Мост приборов: датчик MITE — объект проверки =====
 EXTEND CLASS Device : CheckObject;
 
-// StoreTask.name — явно: у Device есть и второй абстрактный name (ControllerManagement)
-StoreTask.name (Device d) += ISTRING[150](CONCAT ' ', nameType(d), '№' + id(d));
+// StoreTask.name — явно: у Device есть и второй абстрактный name (ControllerManagement).
+// Device.id — тоже явно, и по той же причине: в этом неймспейсе голый id(d) означает
+// StoreTask.id(CheckObject), потому что Device — наследник CheckObject, а текущий
+// неймспейс при разборе имени идёт первым. Без квалификатора номер прибора в названии
+// молча брался из неподнятого сейма и был пуст.
+StoreTask.name (Device d) += ISTRING[150](CONCAT ' ', nameType(d), '№' + Device.id(d));
 address (Device d) += ISTRING[250](Location.name(location(d)));
+
+// Серийный номер прибора — тот же ключ, что виден в названии; по нему приложение
+// адресует объект (objectId в apiTasks) и фильтрует задачи «по этому прибору».
+StoreTask.id (Device d) += ISTRING[30](STRING(Device.id(d)));
+
+// Координаты: у прибора они уже посчитаны в Location — собственные, если телеметрия
+// их присылает, иначе точки размещения. Квалификаторы обязательны, как и у name:
+// latitude/longitude есть и у Location(Device), и у StoreTask(CheckObject).
+StoreTask.latitude (Device d) += DOUBLE(Location.latitude(d));
+StoreTask.longitude (Device d) += DOUBLE(Location.longitude(d));
 
 // ===== Права: организация задачи выводится из её прибора, не хранится.
 // Орг-пользователь видит и назначает только в рамках своей организации;

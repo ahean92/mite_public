@@ -1,6 +1,6 @@
 MODULE Location;
 
-REQUIRE Controller, Device, Geo, Measurement, Hierarchy;
+REQUIRE Controller, Device, Geo, Measurement, Hierarchy, SystemEvents;
 
 CLASS Location 'Точка размещения' : POI;
 name 'Название' = DATA STRING (Location) NONULL IN id;
@@ -105,6 +105,14 @@ CLASS AreaPolygon 'Полигон';
 area = DATA Area (AreaPolygon);
 coordinates 'Координаты' = DATA STRING (AreaPolygon);
 coordinates(AreaPolygon a) <- '53.84684032429679 27.561952658741678,53.92699222038149 27.641596092859622,53.91728609378836 27.4658280611572' WHEN SET (a IS AreaPolygon); // minsk
+
+// isPointInPolygon разворачивается в ST_MakePoint/ST_Intersects — их даёт расширение
+// postgis, которое в базе надо создать отдельно (в дистрибутиве PostgreSQL оно есть,
+// но ни в одной базе не включено). Регистрация здесь, рядом с единственным местом,
+// которое её требует; способ — из комментария platform/.../utils/Geo.lsf.
+// Без этого currentValue(InAreaConditionValue) (MATERIALIZED) роняет любой APPLY,
+// затрагивающий координаты прибора или точки размещения.
+onStarted() + { INTERNAL DB 'CREATE EXTENSION IF NOT EXISTS postgis;'; }
 
 isIn(DOUBLE latitude, DOUBLE longitude, Area area) = GROUP SUM 1 IF isPointInPolygon(latitude, longitude, coordinates(AreaPolygon ap)) BY area(ap);
 isIn(Device d, Area area) = isIn(latitude(d), longitude(d), area);
