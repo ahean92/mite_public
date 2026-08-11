@@ -169,12 +169,12 @@ cellAddr 'Ячейка' (Cell3D c) = cellCode(c);
 storeIdx (Cell3D c) = cellNum(c) - INTEGER(cellNum(c) / 6) * 6;
 storeNameOf 'Магазин' (Cell3D c) =
     CASE
-        WHEN storeIdx(c) = 0 THEN 'Пятёрочка, Ленина 8'
-        WHEN storeIdx(c) = 1 THEN 'Магнит, Мира 14'
-        WHEN storeIdx(c) = 2 THEN 'Перекрёсток, ТЦ Аура'
-        WHEN storeIdx(c) = 3 THEN 'Дикси, Гагарина 3'
-        WHEN storeIdx(c) = 4 THEN 'ВкусВилл, Кирова 22'
-        ELSE 'Лента, Объездная 1';
+        WHEN storeIdx(c) = 0 THEN '«Соседи», Притыцкого 29'
+        WHEN storeIdx(c) = 1 THEN '«Соседи», Немига 12'
+        WHEN storeIdx(c) = 2 THEN '«Соседи», Независимости 168'
+        WHEN storeIdx(c) = 3 THEN '«Соседи», Ангарская 60'
+        WHEN storeIdx(c) = 4 THEN '«Соседи», Есенина 16'
+        ELSE '«Соседи», Каменногорская 3';
 
 cellColor (Cell3D c) =
     CASE
@@ -260,6 +260,10 @@ etMtbf 'Наработка до ТО, ч' = DATA INTEGER (EquipmentType);
 etSpare 'ЗИП' = DATA ISTRING[60] (EquipmentType);
 etSpareQty 'ЗИП на складе, шт' = DATA INTEGER (EquipmentType);
 etCount 'Кол-во в цехе/складе' = DATA INTEGER (EquipmentType);
+// норма температуры типа: одна точка правды, из которой заводятся пороги управления
+// на приборе каждой единицы этого типа (см. SosediDemo.mkLimits)
+etTempMin 'Норма t°, от' = DATA DOUBLE (EquipmentType);
+etTempMax 'Норма t°, до' = DATA DOUBLE (EquipmentType);
 // компактная запись (9 полей) — держим близко к scenRec, чтобы не породить гигантский SQL
 equipRec (EquipmentType e) = 'E^' + (OVERRIDE etName(e), '') + '^' + (OVERRIDE etShape(e), 'machine') + '^' + (OVERRIDE etKind(e), 'machine')
     + '^' + (OVERRIDE ('' + etPowerKw(e)), '0') + '^' + (OVERRIDE ('' + etVibMax(e)), '7') + '^' + (OVERRIDE ('' + etMtbf(e)), '0')
@@ -268,7 +272,7 @@ equipData () = GROUP CONCAT equipRec(EquipmentType e), '~' ORDER etName(e), e;
 
 FORM equipmentTypes 'Справочник оборудования'
     OBJECTS e = EquipmentType
-    PROPERTIES (e) etName, etShape, etKind, etCount, etTemp, etVib, etHum, etPowerS, etDoor, etPowerKw, etVibMax, etMtbf, etSpare, etSpareQty, NEW, DELETE
+    PROPERTIES (e) etName, etShape, etKind, etCount, etTemp, etVib, etHum, etPowerS, etDoor, etPowerKw, etVibMax, etTempMin, etTempMax, etMtbf, etSpare, etSpareQty, NEW, DELETE
 ;
 
 // ============================================================

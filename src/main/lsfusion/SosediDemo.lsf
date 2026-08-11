@@ -1,0 +1,517 @@
+MODULE SosediDemo;
+
+REQUIRE Scheme, StoreTaskMite, ManagementReport,
+        OrgUser, OrgDevice, OrgLocation, DefaultData, Authentication;
+
+// Демонстрационный набор данных розничной сети «Соседи»: магазины Минска,
+// холодильное оборудование торгового зала (горки, лари, витрины) и камеры
+// распределительного центра, приборы MITE с суточной историей, пороги режима,
+// одна реальная авария со сквозным следом «инцидент → акт → задача», персонал
+// с учётными записями и задачи подсистемы «Управление персоналом».
+//
+// Каждый шаг генератора идемпотентен по своему ключу, поэтому повторный запуск
+// дополняет недостающее, а не плодит дубли. Полный сброс — dropSosediDemo (на форму
+// намеренно не вынесен: удаляет организацию со всеми её данными).
+//
+// Отдельный модуль, а не дополнение MiteTestData: MiteTestData — минимальный набор
+// для пустой базы, здесь — развёрнутый отраслевой кейс.
+
+// ===== Опорные точки поиска (сид переиспользует их между сессиями) =====
+orgName () = 'ООО «Соседи» (демо)';
+sosedi () = Organization.organization(orgName());
+
+store (STRING nm) = GROUP MAX Location l IF name(l) = nm AND Location.organization(l) = sosedi();
+equipType (ISTRING[80] nm) = GROUP MAX EquipmentType e IF etName(e) = nm;
+sosediDeviceType () = GROUP MAX DeviceType dt IF name(dt) = r'MITE-T2 (термогигрометр)';
+managerByName (STRING nm) = GROUP MAX ControllerManager m IF ControllerManagement.name(m) = nm;
+employeeByName (STRING fio) = GROUP MAX Employee e IF ManagementReport.name(e) = fio;
+taskByName (ISTRING nm) = GROUP MAX Task t IF StoreTask.name(t) = nm;
+woByObject (ISTRING[90] ob) = GROUP MAX WorkOrder w IF woObject(w) = ob;
+
+// прибор, который в сиде уходит за верхнюю границу — ларь в магазине на Притыцкого
+alarmDevice () = device(470102);
+
+// Демо-объекты опознаются по собственным ключам, а НЕ по ссылке на организацию:
+// ссылка рвётся, как только организация удалена или подменена, и сброс тогда молча
+// перестаёт находить свои же данные. Диапазон 4700xx–4709xx занят только этим сидом.
+demoDevice (Device d) = Device.id(d) >= 470000 AND Device.id(d) <= 479999;
+// прибор объявлен внутри GROUP — иначе он останется свободным параметром условия
+// удаления, и платформа ответит «операция над множеством некорректна»
+demoManager (ControllerManager m) = GROUP SUM 1 IF usedValue(m, Device d) AND demoDevice(d);
+demoTask (Task t) = GROUP SUM 1 IF checkObject(t) = Device d AND demoDevice(d);
+
+// ===== Шаги сида =====
+// Сид и сброс идут через HTTP Action API, где отказ APPLY по ограничению никому не
+// виден: сессия просто откатывается, вызывающий получает 200 и уверенность, что всё
+// прошло. Поэтому каждый шаг проверяет canceled() и падает громко.
+applyStep (STRING step) {
+    APPLY;
+    IF canceled() THEN throwException('Демо-данные «Соседи», шаг «' + step + '»: ' + applyMessage());
+}
+
+// Магазин сети: точка размещения с адресом и координатами (по ним же садится
+// оборудование на карту объектов).
+mkStore (STRING nm, ISTRING addr, NUMERIC[13,8] lat, NUMERIC[13,8] lon) {
+    IF NOT store(nm) THEN
+        NEW l = Location {
+            name(l) <- nm;
+            address(l) <- addr;
+            Location.latitude(l) <- lat;
+            Location.longitude(l) <- lon;
+            Location.organization(l) <- sosedi();
+        }
+}
+
+// Тип холодильного оборудования: форма для 3D, нормы температуры (из них потом
+// выводятся пороги управления) и ЗИП.
+mkEquipType (ISTRING[80] nm, ISTRING[12] shape, DOUBLE lo, DOUBLE hi, DOUBLE kw, ISTRING[60] spare, INTEGER cnt) {
+    IF NOT equipType(nm) THEN
+        NEW e = EquipmentType {
+            etName(e) <- nm;
+            etShape(e) <- shape;
+            etKind(e) <- r'cold';
+            etTemp(e) <- TRUE;
+            etDoor(e) <- TRUE;
+            etPowerS(e) <- TRUE;
+            etPowerKw(e) <- kw;
+            etVibMax(e) <- 5.0;
+            etMtbf(e) <- 4000;
+            etSpare(e) <- spare;
+            etSpareQty(e) <- 4;
+            etCount(e) <- cnt;
+            etTempMin(e) <- lo;
+            etTempMax(e) <- hi;
+        }
+}
+
+// Единица оборудования = прибор MITE + экземпляр в справочнике оборудования,
+// связанный с этим прибором «живой» метрикой.
+mkFridge (STRING storeName, ISTRING[80] typeName, ISTRING[80] unitName, ISTRING[40] grp, INTEGER ix, LONG devId) {
+    IF NOT device(devId) THEN
+        NEW d = Device {
+            Device.id(d) <- devId;
+            // Device.type / Location.latitude — с квалификатором: у Device есть ещё
+            // абстрактный type(ManagementDevice), у Location — latitude из POI
+            Device.type(d) <- sosediDeviceType();
+            location(d) <- store(storeName);
+            organization(d) <- sosedi();
+            dateCheck(d) <- sum(currentDate(), 90 + ix * 45);
+            NEW u = EquipmentUnit {
+                euName(u) <- unitName;
+                euScope(u) <- r'store';
+                euType(u) <- equipType(typeName);
+                euGroup(u) <- grp;
+                euIndex(u) <- ix;
+                euDevice(u) <- d;
+                euMeasure(u) <- temperatureType();
+                euSource(u) <- r'live';
+                euGeoLat(u) <- DOUBLE(Location.latitude(store(storeName)));
+                euGeoLon(u) <- DOUBLE(Location.longitude(store(storeName)));
+            }
+        }
+}
+
+// Профиль продукции — норма хранения товарной группы (справочник мастер-данных).
+mkProfile (ISTRING[80] nm, INTEGER lo, INTEGER hi, INTEGER hum, INTEGER shelf) {
+    IF NOT (GROUP SUM 1 IF ppName(ProductProfile p) = nm) THEN
+        NEW p = ProductProfile { ppName(p) <- nm; ppTempMin(p) <- lo; ppTempMax(p) <- hi; ppHum(p) <- hum; ppShelf(p) <- shelf; }
+}
+
+// Учётная запись + сотрудник одной записью. Сотрудник без учётки тоже валидный
+// исполнитель, поэтому логин передаётся отдельно (см. директоров магазинов ниже).
+mkStaff (STRING lg, STRING first, STRING last, STRING fio, STRING pos, STRING role) {
+    IF NOT customUserLowerLogin(lg) THEN
+        NEW u = CustomUser {
+            login(u) <- lg;
+            firstName(u) <- first;
+            lastName(u) <- last;
+            organization(u) <- sosedi();
+            in(u, userRoleSID(role)) <- TRUE;
+            setSHA256Password(u, r'demo');
+            NEW e = Employee {
+                ManagementReport.name(e) <- fio;
+                position(e) <- pos;
+                organization(e) <- sosedi();
+                user(e) <- u;
+            }
+        }
+}
+
+// Задача службы эксплуатации. Тип у всех один («Процедура»): в mite задача — это
+// выезд по объекту проверки, а объект проверки — прибор MITE на оборудовании.
+mkTask (ISTRING nm, LONG devId, STRING statusId, STRING prioId, STRING lg, INTEGER days, INTEGER prog, STRING descr) {
+    IF NOT taskByName(nm) THEN
+        NEW t = Task {
+            StoreTask.name(t) <- nm;
+            checkObject(t) <- device(devId);
+            type(t) <- taskType(r'form');
+            status(t) <- taskStatus(statusId);
+            priority(t) <- taskPriority(prioId);
+            assignedTo(t) <- employee(customUserLowerLogin(lg));
+            deadline(t) <- sum(currentDate(), days);
+            progress(t) <- prog;
+            description(t) <- descr;
+            // у закрытой задачи есть след выполнения — иначе в карточке пусто
+            IF statusId = r'done' THEN NEW ex = Execution {
+                task(ex) <- t;
+                executor(ex) <- employee(customUserLowerLogin(lg));
+                dateTime(ex) <- currentDateTime();
+                state(ex) <- ExecutionState.finished;
+            }
+        }
+}
+
+mkDirector (STRING fio) {
+    IF NOT employeeByName(fio) THEN
+        NEW e = Employee { ManagementReport.name(e) <- fio; position(e) <- 'Директор магазина'; organization(e) <- sosedi(); }
+}
+
+// Пороги температурного режима: на каждую единицу оборудования два управления —
+// верхняя и нижняя граница нормы её типа. Оба участвуют в отчёте, поэтому
+// min/maxReportFixedValue у прибора берутся именно отсюда (и ими же дальше
+// ограничивается генерация истории измерений).
+mkLimits () {
+    FOR EquipmentUnit u IS EquipmentUnit AND euScope(u) = r'store' AND euDevice(u) AND etTempMax(euType(u))
+            AND NOT managerByName(euName(u) + ' — выше нормы') DO {
+        NEW m = ControllerManager {
+            ControllerManagement.name(m) <- euName(u) + ' — выше нормы';
+            // организация управления обязательна: belongsCurrentOrganization сверяет её
+            // с организацией прибора, а без совпадения min/maxReportFixedValue пусты
+            ControllerManagement.organization(m) <- sosedi();
+            inReport(m) <- TRUE;
+            NEW fv = FixedConditionValue {
+                value(fv) <- etTempMax(euType(u));
+                ControllerManagement.name(fv) <- 'Норма, до';
+                NEW c = ValuesCondition {
+                    controller(c) <- m;
+                    left(c) <- measurementConditionValue(euDevice(u), temperatureType());
+                    right(c) <- fv;
+                }
+            }
+        }
+        NEW m = ControllerManager {
+            ControllerManagement.name(m) <- euName(u) + ' — ниже нормы';
+            ControllerManagement.organization(m) <- sosedi();
+            inReport(m) <- TRUE;
+            NEW fv = FixedConditionValue {
+                value(fv) <- etTempMin(euType(u));
+                ControllerManagement.name(fv) <- 'Норма, от';
+                NEW c = ValuesCondition {
+                    controller(c) <- m;
+                    left(c) <- fv;
+                    right(c) <- measurementConditionValue(euDevice(u), temperatureType());
+                }
+            }
+        }
+    }
+}
+
+// Суточная история с шагом 30 минут. Значение держится внутри полосы нормы
+// самого прибора; у аварийного ларя последние три часа — выше верхней границы.
+mkHistory () {
+    LOCAL tm = ZDATETIME ();
+    FOR Device d IS Device AND organization(d) = sosedi() AND maxReportFixedValue(d, temperatureType())
+            AND NOT lastMeasurement(d) DO {
+        tm() <- sumSeconds(currentZDateTime(), -86400);
+        WHILE tm() <= currentZDateTime() DO {
+            NEW ms = Measurement {
+                device(ms) <- d;
+                dateTime(ms) <- tm();
+                value(ms, temperatureType()) <- minReportFixedValue(d, temperatureType())
+                    + (maxReportFixedValue(d, temperatureType()) - minReportFixedValue(d, temperatureType())) * (0.2 + random() * 0.6);
+                value(ms, humidityType()) <- 62.0 + (random() - 0.5) * 14;
+                value(ms, batteryType()) <- 97.0 - random() * 12;
+                IF d = alarmDevice() AND tm() >= sumSeconds(currentZDateTime(), -10800) THEN
+                    value(ms, temperatureType()) <- maxReportFixedValue(d, temperatureType()) + 1.5 + random() * 2.5;
+            }
+            tm() <- sumSeconds(tm(), 1800);
+        }
+    }
+}
+
+// ===== Генератор =====
+generateSosediDemo 'Демо-данные сети «Соседи»' () {
+
+    // статусы/приоритеты/типы задач — если «Данные по умолчанию» ещё не грузили
+    NEWSESSION {
+        IF NOT taskStatus(r'new') THEN loadDefaultData();
+        applyStep('данные по умолчанию');
+    }
+
+    NEWSESSION {
+        IF NOT sosedi() THEN NEW o = Organization {
+            name(o) <- orgName();
+            unn(o) <- r'190845112';
+            address(o) <- 'г. Минск, ул. Тимирязева, 65Б, офис 401';
+            contact(o) <- 'Кравцов Дмитрий Леонидович';
+            phone(o) <- '+375 17 388-15-40';
+            site(o) <- 'sosedi.by';
+            email(o) <- 'service@sosedi.by';
+            noise(o) <- 0.25;
+            periodMinutes(o) <- 5.0;
+        }
+        applyStep('организация');
+    }
+
+    // персонал сети: служба эксплуатации + контроль качества на местах
+    NEWSESSION {
+        mkStaff(r'sosedi.admin', 'Дмитрий', 'Кравцов', 'Кравцов Дмитрий Леонидович', 'Руководитель службы эксплуатации', r'orgadmin');
+        mkStaff(r'sosedi.eng', 'Андрей', 'Лукашевич', 'Лукашевич Андрей Петрович', 'Инженер по холодильному оборудованию', r'orguser');
+        mkStaff(r'sosedi.tech1', 'Виктор', 'Панкратов', 'Панкратов Виктор Сергеевич', 'Техник-механик', r'orguser');
+        mkStaff(r'sosedi.tech2', 'Игорь', 'Сацук', 'Сацук Игорь Валерьевич', 'Техник-механик', r'orguser');
+        mkStaff(r'sosedi.qc', 'Марина', 'Ходасевич', 'Ходасевич Марина Олеговна', 'Товаровед-контролёр', r'orguser');
+        // директора магазинов — исполнители без учётной записи: в актах и истории есть, не логинятся
+        mkDirector('Дубровская Ольга Ивановна');
+        mkDirector('Гринкевич Тамара Николаевна');
+        applyStep('персонал');
+    }
+
+    // типы измерений и прибор сети
+    NEWSESSION {
+        IF NOT temperatureType() THEN NEW mt = MeasurementType { id(mt) <- 901; name(mt) <- r'Температура'; }
+        IF NOT humidityType() THEN NEW mt = MeasurementType { id(mt) <- 902; name(mt) <- r'Влажность'; }
+        IF NOT batteryType() THEN NEW mt = MeasurementType { id(mt) <- 903; name(mt) <- r'Батарея'; }
+        applyStep('типы измерений');
+    }
+    NEWSESSION {
+        IF NOT sosediDeviceType() THEN NEW dt = DeviceType {
+            id(dt) <- 940;
+            name(dt) <- r'MITE-T2 (термогигрометр)';
+            number(dt, temperatureType()) <- 1;
+            number(dt, humidityType()) <- 2;
+            number(dt, batteryType()) <- 3;
+        }
+        applyStep('тип прибора');
+    }
+
+    // мастер-данные: товарные группы и типы холодильного оборудования
+    NEWSESSION {
+        mkProfile('Молочная гастрономия', 0, 4, 85, 14);
+        mkProfile('Мясо и птица охлаждённые', -1, 4, 85, 5);
+        mkProfile('Замороженные продукты', -20, -15, 70, 180);
+        mkProfile('Напитки', 2, 8, 60, 120);
+        mkEquipType('Горка холодильная пристенная', r'hvac', 0.0, 4.0, 2.2, 'вентилятор испарителя', 12);
+        mkEquipType('Ларь морозильный', r'hvac', -20.0, -15.0, 0.9, 'уплотнитель двери', 12);
+        mkEquipType('Шкаф холодильный (витрина)', r'hvac', 2.0, 8.0, 1.4, 'ТРВ', 12);
+        mkEquipType('Камера холодильная РЦ', r'compressor', 0.0, 4.0, 6.5, 'хладагент R404', 2);
+        mkEquipType('Камера морозильная РЦ', r'compressor', -22.0, -18.0, 9.0, 'хладагент R404', 1);
+        applyStep('мастер-данные');
+    }
+
+    // магазины сети и распределительный центр
+    NEWSESSION {
+        mkStore('«Соседи» на Притыцкого', 'г. Минск, ул. Притыцкого, 29', 53.90780000, 27.47150000);
+        mkStore('«Соседи» на Немиге', 'г. Минск, ул. Немига, 12', 53.90450000, 27.55100000);
+        mkStore('«Соседи» в Уручье', 'г. Минск, пр-т Независимости, 168', 53.94100000, 27.67200000);
+        mkStore('«Соседи» на Ангарской', 'г. Минск, ул. Ангарская, 60', 53.87600000, 27.64800000);
+        mkStore('«Соседи» в Малиновке', 'г. Минск, ул. Есенина, 16', 53.85600000, 27.48800000);
+        mkStore('«Соседи» на Каменногорской', 'г. Минск, ул. Каменногорская, 3', 53.91600000, 27.43400000);
+        mkStore('РЦ «Соседи», Логойский тракт', 'г. Минск, Логойский тракт, 37', 53.96000000, 27.61000000);
+        applyStep('магазины');
+    }
+
+    // холодильное оборудование торговых залов: горка, ларь и витрина в каждом магазине
+    NEWSESSION {
+        mkFridge('«Соседи» на Притыцкого', 'Горка холодильная пристенная', 'Притыцкого · горка молочная', 'торговый зал', 1, 470101);
+        mkFridge('«Соседи» на Притыцкого', 'Ларь морозильный', 'Притыцкого · ларь заморозки', 'торговый зал', 2, 470102);
+        mkFridge('«Соседи» на Притыцкого', 'Шкаф холодильный (витрина)', 'Притыцкого · витрина напитков', 'торговый зал', 3, 470103);
+        mkFridge('«Соседи» на Немиге', 'Горка холодильная пристенная', 'Немига · горка молочная', 'торговый зал', 1, 470201);
+        mkFridge('«Соседи» на Немиге', 'Ларь морозильный', 'Немига · ларь заморозки', 'торговый зал', 2, 470202);
+        mkFridge('«Соседи» на Немиге', 'Шкаф холодильный (витрина)', 'Немига · витрина гастрономии', 'торговый зал', 3, 470203);
+        mkFridge('«Соседи» в Уручье', 'Горка холодильная пристенная', 'Уручье · горка молочная', 'торговый зал', 1, 470301);
+        mkFridge('«Соседи» в Уручье', 'Ларь морозильный', 'Уручье · ларь заморозки', 'торговый зал', 2, 470302);
+        mkFridge('«Соседи» в Уручье', 'Шкаф холодильный (витрина)', 'Уручье · витрина мясная', 'торговый зал', 3, 470303);
+        mkFridge('«Соседи» на Ангарской', 'Горка холодильная пристенная', 'Ангарская · горка молочная', 'торговый зал', 1, 470401);
+        mkFridge('«Соседи» на Ангарской', 'Ларь морозильный', 'Ангарская · ларь заморозки', 'торговый зал', 2, 470402);
+        mkFridge('«Соседи» на Ангарской', 'Шкаф холодильный (витрина)', 'Ангарская · витрина напитков', 'торговый зал', 3, 470403);
+        mkFridge('«Соседи» в Малиновке', 'Горка холодильная пристенная', 'Малиновка · горка молочная', 'торговый зал', 1, 470501);
+        mkFridge('«Соседи» в Малиновке', 'Ларь морозильный', 'Малиновка · ларь заморозки', 'торговый зал', 2, 470502);
+        mkFridge('«Соседи» в Малиновке', 'Шкаф холодильный (витрина)', 'Малиновка · витрина гастрономии', 'торговый зал', 3, 470503);
+        mkFridge('«Соседи» на Каменногорской', 'Горка холодильная пристенная', 'Каменногорская · горка молочная', 'торговый зал', 1, 470601);
+        mkFridge('«Соседи» на Каменногорской', 'Ларь морозильный', 'Каменногорская · ларь заморозки', 'торговый зал', 2, 470602);
+        mkFridge('«Соседи» на Каменногорской', 'Шкаф холодильный (витрина)', 'Каменногорская · витрина напитков', 'торговый зал', 3, 470603);
+        mkFridge('РЦ «Соседи», Логойский тракт', 'Камера холодильная РЦ', 'РЦ · камера охлаждения №1', 'зона A', 1, 470901);
+        mkFridge('РЦ «Соседи», Логойский тракт', 'Камера холодильная РЦ', 'РЦ · камера охлаждения №2', 'зона B', 2, 470902);
+        mkFridge('РЦ «Соседи», Логойский тракт', 'Камера морозильная РЦ', 'РЦ · камера заморозки', 'зона C', 3, 470903);
+        applyStep('оборудование');
+    }
+
+    // пороги режима (после APPLY оборудования — иначе не видно связку прибор/метрика)
+    NEWSESSION {
+        mkLimits();
+        applyStep('пороги режима');
+    }
+
+    // суточная история измерений по полосе нормы каждого прибора
+    NEWSESSION {
+        mkHistory();
+        applyStep('история измерений');
+    }
+
+    // авария: у ларя на Притыцкого верхнее управление сработало по факту измерений.
+    // Отсюда платформа сама заводит ManagerLog, а StoreTaskMite — задачу на выезд.
+    NEWSESSION {
+        FOR ControllerManager m IS ControllerManager AND usedValue(m, alarmDevice()) AND shouldBeOn(m) AND NOT isOn(m) DO
+            isOn(m) <- TRUE;
+        applyStep('авария');
+    }
+
+    // акт обработки инцидента — то, что оператор заполняет руками в «Обработке инцидентов»
+    NEWSESSION {
+        FOR ManagerLog l IS ManagerLog AND isOn(l) AND usedValue(manager(l), alarmDevice()) AND NOT registrationNumber(l) DO {
+            deviationType(l) <- DeviationType.detected;
+            deviationStatus(l) <- DeviationStatus.significant;
+            registrationNumber(l) <- 'ИНЦ-2026-0147';
+            reportName(l) <- 'Акт об отклонении температурного режима';
+            deviationDescription(l) <- 'Температура в ларе заморозки торгового зала магазина на Притыцкого вышла за верхнюю границу режима хранения. Отклонение держится более трёх часов, товарное соседство — замороженные полуфабрикаты и мороженое.';
+            causeExplanation(l) <- 'Предварительно — неплотное прилегание крышки: изношен уплотнитель, крышка не доводится до конца после выкладки товара.';
+            responsible(l) <- employee(customUserLowerLogin(r'sosedi.eng'));
+            registrant(l) <- employee(customUserLowerLogin(r'sosedi.qc'));
+            approver(l) <- employee(customUserLowerLogin(r'sosedi.admin'));
+        }
+        applyStep('акт инцидента');
+    }
+
+    // Задачи «Управления персоналом» — рабочий бэклог службы эксплуатации сети:
+    // плановое ТО, реакция на инциденты, поверки, контроль качества на местах.
+    NEWSESSION {
+        mkTask('Плановое ТО холодильных горок — Немига', 470201, r'new', r'normal', r'sosedi.tech1', 5, 0,
+               'Квартальное ТО: чистка конденсатора, проверка дренажа, контроль перегрева ТРВ, протяжка клеммных соединений.');
+        mkTask('Поверка приборов MITE — магазины Юго-Запада', 470501, r'new', r'low', r'sosedi.eng', 21, 0,
+               'Сверить показания приборов с эталонным термометром, оформить протокол поверки, обновить дату поверки в карточках приборов.');
+        mkTask('Замена уплотнителя крышки ларя — Притыцкого', 470102, r'in progress', r'high', r'sosedi.tech2', 0, 40,
+               'Уплотнитель крышки изношен, ларь не держит режим. Заменить уплотнитель, отрегулировать доводчик, проконтролировать выход на режим в течение часа.');
+        mkTask('Контроль температурного режима витрин — Малиновка', 470503, r'done', r'normal', r'sosedi.qc', -1, 100,
+               'Обход торгового зала: сверка показаний витрин с журналом, контроль выкладки по товарному соседству.');
+        mkTask('Чистка конденсаторов горок — Уручье', 470301, r'new', r'normal', r'sosedi.tech1', 7, 0,
+               'Конденсаторы забиты пылью, растёт потребление. Чистка, проверка вентиляторов обдува, замер тока компрессора.');
+        mkTask('Проверка системы оттайки ларей — Ангарская', 470402, r'in progress', r'normal', r'sosedi.tech2', 10, 25,
+               'Наледь на испарителе. Проверить таймер оттайки и ТЭН, прочистить дренаж, при необходимости заменить датчик окончания оттайки.');
+        mkTask('Ревизия камеры заморозки РЦ перед сезоном', 470903, r'in progress', r'high', r'sosedi.eng', 3, 60,
+               'Предсезонная ревизия: давление в контуре, состояние компрессора, плотность дверей, калибровка приборов, протокол по итогам.');
+        mkTask('Замена вентилятора испарителя — Каменногорская', 470601, r'new', r'high', r'sosedi.tech2', 1, 0,
+               'Вентилятор испарителя горки шумит и периодически останавливается. Заменить узел из ЗИП, проверить крепление и обдув.');
+        mkTask('Ежедневный обход: журнал температур — Притыцкого', 470101, r'done', r'normal', r'sosedi.qc', -1, 100,
+               'Снятие показаний по торговому залу, сверка с нормой хранения товарных групп, отметка в журнале.');
+        mkTask('Настройка ТРВ витрины напитков — Немига', 470203, r'new', r'normal', r'sosedi.tech1', 4, 0,
+               'Витрина недоохлаждает в часы пик. Настроить перегрев ТРВ, проверить заправку, снять показания через сутки.');
+        mkTask('Инструктаж смены по товарному соседству — Малиновка', 470502, r'new', r'low', r'sosedi.qc', 14, 0,
+               'Провести инструктаж по выкладке и товарному соседству, разобрать случаи размещения этилен-чувствительных групп рядом с фруктами.');
+        mkTask('Проверка автоматики после просадки напряжения — Ангарская', 470401, r'in progress', r'urgent', r'sosedi.eng', 0, 70,
+               'Ночью зафиксирована просадка в сети, сработала защита компрессора. Проверить пускатели и автоматику, оценить состояние пускового реле.');
+        mkTask('Заявка на ЗИП: уплотнители и вентиляторы', 470102, r'new', r'low', r'sosedi.admin', 9, 0,
+               'Сформировать заявку поставщику по итогам списаний ТОиР: уплотнители дверей, вентиляторы испарителя, комплект фильтров.');
+        mkTask('Годовая поверка приборов РЦ', 470901, r'new', r'normal', r'sosedi.eng', 30, 0,
+               'Плановая годовая поверка приборов распределительного центра, оформление свидетельств, обновление дат поверки.');
+        mkTask('Разбор просроченной выкладки — Уручье', 470303, r'new', r'high', r'sosedi.qc', 2, 0,
+               'Выявлены позиции с истекающим сроком в мясной витрине. Разобрать выкладку, оформить списание, проверить ротацию партий.');
+        applyStep('задачи');
+    }
+
+    // ЗИП торговой сети и наряды ТОиР (списание идёт через штатную проводку createWO)
+    NEWSESSION {
+        IF NOT spareByName('уплотнитель двери') THEN NEW s = Spare { spareName(s) <- 'уплотнитель двери'; spareQty(s) <- 6; spareMin(s) <- 3; sparePrice(s) <- 1750; }
+        IF NOT spareByName('ТРВ') THEN NEW s = Spare { spareName(s) <- 'ТРВ'; spareQty(s) <- 4; spareMin(s) <- 2; sparePrice(s) <- 3900; }
+        IF NOT spareByName('вентилятор испарителя') THEN NEW s = Spare { spareName(s) <- 'вентилятор испарителя'; spareQty(s) <- 5; spareMin(s) <- 2; sparePrice(s) <- 2650; }
+        applyStep('ЗИП');
+    }
+    NEWSESSION {
+        IF NOT woByObject('Уручье · витрина мясная') THEN
+            createWO('Уручье · витрина мясная', 'Обледенение испарителя', 'разморозка, прочистка дренажа, проверка ТЭН оттайки', 'блокировка воздуха и рост t° — 50%', '', 0, 42000);
+        IF NOT woByObject('Ангарская · горка молочная') THEN
+            createWO('Ангарская · горка молочная', 'Засор фильтров холодильника', 'замена фильтров, чистка конденсатора', 'перегрев и поломка мотора — 75%', 'фильтры', 2, 68000);
+        IF NOT woByObject('РЦ · камера охлаждения №2') THEN
+            createWO('РЦ · камера охлаждения №2', 'Утечка хладагента', 'устранена течь на пайке, дозаправка R404', 'полный отказ компрессора — 60%', 'хладагент R404', 1, 210000);
+        applyStep('наряды ТОиР');
+    }
+
+    MESSAGE 'Демо-данные сети «Соседи» загружены.\n\n'
+          + '7 объектов: 6 магазинов Минска и распределительный центр.\n'
+          + '21 прибор MITE на горках, ларях, витринах и камерах РЦ — суточная история с шагом 30 минут.\n'
+          + 'Пороги режима заведены по нормам типов оборудования (две границы на единицу).\n\n'
+          + 'Авария: ларь заморозки на Притыцкого (прибор 470102) третий час выше нормы — заведён акт ИНЦ-2026-0147 и задача на выезд.\n\n'
+          + 'Учётные записи (пароль у всех demo):\n'
+          + '  sosedi.admin — Кравцов Д. Л., руководитель службы эксплуатации\n'
+          + '  sosedi.eng — Лукашевич А. П., инженер по холодильному оборудованию\n'
+          + '  sosedi.tech1 / sosedi.tech2 — техники-механики\n'
+          + '  sosedi.qc — Ходасевич М. О., товаровед-контролёр' NOWAIT;
+}
+
+// ===== Полный сброс демо-набора =====
+// Пересобрать стенд с нуля, не трогая остальную базу. Порядок удаления идёт от
+// ссылающихся объектов к тем, на кого ссылаются; условия управления и выполнения
+// задач платформа убирает сама (controller у ManagerCondition — NONULL AGGR,
+// task у Execution — NONULL DELETE).
+//
+dropStore (STRING nm) { DELETE Location l WHERE name(l) = nm; }
+dropStaff (STRING lg) { DELETE CustomUser u WHERE login(u) = lg; }
+dropEmployee (STRING fio) { DELETE Employee e WHERE ManagementReport.name(e) = fio; }
+
+dropSosediDemo 'Удалить демо-данные сети «Соседи»' () {
+    NEWSESSION {
+        DELETE Task t WHERE demoTask(t);
+        applyStep('задачи');
+    }
+    NEWSESSION {
+        DELETE ManagerLog l WHERE demoManager(manager(l));
+        applyStep('логи управлений');
+    }
+    NEWSESSION {
+        DELETE Measurement ms WHERE demoDevice(device(ms));
+        applyStep('измерения');
+    }
+    NEWSESSION {
+        DELETE ControllerManager m WHERE demoManager(m);
+        applyStep('управления');
+    }
+    NEWSESSION {
+        // положительное условие value(fv) обязательно: голое отрицание даёт неограниченное множество
+        DELETE FixedConditionValue fv WHERE ControllerManagement.value(fv) AND NOT (GROUP SUM 1 IF left(ValuesCondition c) = fv OR right(c) = fv);
+        applyStep('пороговые значения');
+    }
+    NEWSESSION {
+        DELETE EquipmentUnit u WHERE demoDevice(euDevice(u));
+        applyStep('оборудование');
+    }
+    NEWSESSION {
+        DELETE Device d WHERE demoDevice(d);
+        applyStep('приборы');
+    }
+    NEWSESSION {
+        dropEmployee('Кравцов Дмитрий Леонидович');
+        dropEmployee('Лукашевич Андрей Петрович');
+        dropEmployee('Панкратов Виктор Сергеевич');
+        dropEmployee('Сацук Игорь Валерьевич');
+        dropEmployee('Ходасевич Марина Олеговна');
+        dropEmployee('Дубровская Ольга Ивановна');
+        dropEmployee('Гринкевич Тамара Николаевна');
+        applyStep('сотрудники');
+    }
+    NEWSESSION {
+        dropStaff(r'sosedi.admin');
+        dropStaff(r'sosedi.eng');
+        dropStaff(r'sosedi.tech1');
+        dropStaff(r'sosedi.tech2');
+        dropStaff(r'sosedi.qc');
+        applyStep('учётные записи');
+    }
+    NEWSESSION {
+        dropStore('«Соседи» на Притыцкого');
+        dropStore('«Соседи» на Немиге');
+        dropStore('«Соседи» в Уручье');
+        dropStore('«Соседи» на Ангарской');
+        dropStore('«Соседи» в Малиновке');
+        dropStore('«Соседи» на Каменногорской');
+        dropStore('РЦ «Соседи», Логойский тракт');
+        applyStep('магазины');
+    }
+    NEWSESSION {
+        DELETE Organization o WHERE name(o) = orgName();
+        applyStep('организация');
+    }
+    MESSAGE 'Демо-данные сети «Соседи» удалены' NOWAIT;
+}
+
+EXTEND FORM organizations
+    PROPERTIES() generateSosediDemo DRAW o TOOLBAR
+;

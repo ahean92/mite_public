@@ -2,4 +2,4 @@ MODULE MiteApp;
 
 // Зонтик приложения: единая точка сборки всех фич-модулей.
 // topModule = MiteApp (см. lsfusion.properties). MachineBot тянет Mite -> Grafana и т.д.
-REQUIRE MachineBot, Weather, WeatherOpenWeatherMap, Scheme;
+REQUIRE MachineBot, Weather, WeatherOpenWeatherMap, Scheme, SosediDemo;
