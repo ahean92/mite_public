@@ -1,0 +1,768 @@
+MODULE Scheme;
+
+// Навигируемая карта объекта: иерархия схем (площадка → здание → этаж → зона)
+// + кликабельный JS-компонент (клик по зданию/этажу проваливается внутрь).
+// Топ-модуль приложения: тянет цепочку фич (Mite + бот машин).
+REQUIRE Mite, MachineBot;
+
+NAMESPACE Mite;
+
+// ----------------------------- Модель: иерархия схем -----------------------------
+CLASS Scheme 'Схема (план)';
+TABLE scheme (Scheme);
+name 'Название' = DATA ISTRING[150] (Scheme);
+kind 'Тип' = DATA STRING[12] (Scheme);        // site | building | floor | room
+parent = DATA Scheme (Scheme);                 // дерево схем
+nameParent 'Родитель' (Scheme s) = name(parent(s));
+plan 'Подложка' = DATA IMAGEFILE (Scheme);
+widthPx = DATA INTEGER (Scheme);
+heightPx = DATA INTEGER (Scheme);
+
+// ----------------------------- Элемент на схеме -----------------------------
+CLASS SchemeElement 'Элемент';
+TABLE schemeElement (SchemeElement);
+scheme = DATA Scheme (SchemeElement);
+num 'No' = DATA INTEGER (SchemeElement);
+elemType 'Тип' = DATA STRING[12] (SchemeElement);   // building|floor|zone|conveyor|gate|sensor|marker
+geom 'Геометрия' = DATA TEXT (SchemeElement);        // "x,y" (точка) | "x1,y1 x2,y2 ..." (контур)
+label 'Подпись' = DATA STRING[100] (SchemeElement);
+childScheme = DATA Scheme (SchemeElement);           // клик → провалиться сюда
+device = DATA Device (SchemeElement);                // датчик → живой статус
+nameChild 'Открывает' (SchemeElement el) = name(childScheme(el));
+
+// ----------------------------- Статус/цвет/подпись -----------------------------
+schemeValue (Device d) = prevLastValue(d, temperatureType());
+schemeInRange (Device d) = schemeValue(d) >= minReportFixedValue(d, temperatureType())
+                       AND schemeValue(d) <= maxReportFixedValue(d, temperatureType());
+sensorColor (Device d) = OVERRIDE (IF schemeInRange(d) THEN '#2e9b3e' ELSE '#d23b3b'), '#9aa0a6';
+
+elemColor (SchemeElement el) =
+    CASE
+        WHEN elemType(el) = 'sensor'   THEN sensorColor(device(el))
+        WHEN elemType(el) = 'building' THEN '#dbe7ff'
+        WHEN elemType(el) = 'floor'    THEN '#e7f0e7'
+        WHEN elemType(el) = 'zone'     THEN 'rgba(80,120,220,0.12)'
+        WHEN elemType(el) = 'gate'     THEN '#f0a030'
+        WHEN elemType(el) = 'conveyor' THEN '#9aa7c2'
+        ELSE '#cfd4da';
+
+elemLabel (SchemeElement el) =
+    OVERRIDE (tempStr(schemeValue(device(el))) IF elemType(el) = 'sensor'), label(el);
+
+// ----------------------------- Навигация (текущая схема) -----------------------------
+currentScheme = DATA LOCAL Scheme ();
+rootScheme () = GROUP MAX Scheme s IF NOT parent(s);
+effScheme () = OVERRIDE currentScheme(), rootScheme();
+
+// хлебные крошки (до 3 уровней)
+crumbText 'Путь' () =
+    (OVERRIDE name(parent(parent(effScheme()))) + '  ›  ', '')
+  + (OVERRIDE name(parent(effScheme())) + '  ›  ', '')
+  + (OVERRIDE name(effScheme()), '');
+
+goUp 'Вверх' () { currentScheme() <- parent(effScheme()); }
+hasParent () = parent(effScheme()) IS Scheme;
+
+// ----------------------------- Данные для JS-компонента (JSON-строкой) -----------------------------
+// данные компоненту — строкой с разделителями (без {} и JSON: {} в lsFusion = ключ локализации)
+// формат: meta '~' elem '~' elem ...   meta = name^w^h   elem = n^t^g^l^c^ch
+elemRec (SchemeElement el) =
+    num(el) + '^' + elemType(el) + '^' + geom(el)
+  + '^' + (OVERRIDE elemLabel(el), '') + '^' + (OVERRIDE elemColor(el), '#ccc')
+  + '^' + (IF childScheme(el) THEN 1 ELSE 0);
+
+elemsStr (Scheme s) = GROUP CONCAT elemRec(SchemeElement el) IF scheme(el) = s, '~' ORDER num(el);
+
+mapData 'Карта' () =
+    (OVERRIDE name(effScheme()), '') + '^' + (OVERRIDE widthPx(effScheme()), 900) + '^' + (OVERRIDE heightPx(effScheme()), 500)
+  + (OVERRIDE '~' + elemsStr(effScheme()), '');
+
+// клик из компонента: {"action":"open","n":<num>}
+onMapEvent () {
+    INPUT f = JSON DO
+        IMPORT JSON FROM f FIELDS() STRING action, INTEGER n DO {
+            IF action = 'open' THEN
+                FOR num(SchemeElement el) = n AND scheme(el) = effScheme() AND childScheme(el) DO
+                    currentScheme() <- childScheme(el);
+        }
+}
+
+// регистрация статики компонента
+onWebClientInit() + {
+    onWebClientInit('scheme.js') <- 1;
+    onWebClientInit('scheme.css') <- 2;
+}
+
+// ----------------------------- Форма -----------------------------
+FORM facilityMap 'Карта объекта'
+    PROPERTIES crumbText() READONLY, goUp() SHOWIF hasParent()
+    PROPERTIES mapData() CUSTOM 'schemeMap' ON CHANGE onMapEvent()
+;
+
+DESIGN facilityMap {
+    NEW bar { horizontal = TRUE; MOVE PROPERTY(crumbText()) { fill = 1; }; MOVE PROPERTY(goUp()); }
+    NEW map { fill = 1; MOVE PROPERTY(mapData()); }
+}
+
+// facilityMap (2D-карта) остаётся как форма, но в меню её нет — единое меню «Цифровой склад».
+
+// ============================================================
+// 3D-склад (Three.js): стеллажи + ячейки, цвет по статусу
+// ============================================================
+CLASS Rack3D 'Стеллаж';
+TABLE rack3d (Rack3D);
+warehouse = DATA Scheme (Rack3D);
+rackIndex 'No' = DATA INTEGER (Rack3D);
+rackName 'Название' = DATA STRING[40] (Rack3D);
+posX 'X' = DATA INTEGER (Rack3D);
+posZ 'Z' = DATA INTEGER (Rack3D);
+cols 'Секций' = DATA INTEGER (Rack3D);
+levels 'Ярусов' = DATA INTEGER (Rack3D);
+orient 'Ориентация' = DATA INTEGER (Rack3D);   // 0 = вдоль X, 1 = вдоль Z
+
+CLASS Cell3D 'Ячейка';
+TABLE cell3d (Cell3D);
+rack = DATA Rack3D (Cell3D);
+col 'Секция' = DATA INTEGER (Cell3D);
+level 'Ярус' = DATA INTEGER (Cell3D);
+occupied 'Занята' = DATA BOOLEAN (Cell3D);
+device = DATA Device (Cell3D);
+cellCode 'Адрес' = DATA STRING[20] (Cell3D);
+cellNum = DATA INTEGER (Cell3D);
+sku 'Товар' = DATA STRING[40] (Cell3D);
+qty 'Кол-во' = DATA INTEGER (Cell3D);
+expiry 'Годен до' = DATA DATE (Cell3D);
+price 'Цена, ₽' = DATA INTEGER (Cell3D);
+daysLeft 'Осталось дней' (Cell3D c) = daysBetweenDates(currentDate(), expiry(c));
+tempAlarm (Cell3D c) = device(c) AND NOT schemeInRange(device(c));
+
+cellAlarm (Cell3D c) =
+    (device(c) AND NOT schemeInRange(device(c)))
+    OR (occupied(c) AND daysLeft(c) <= 3);
+taskDone 'Выполнено' = DATA BOOLEAN (Cell3D);
+doneTime = DATA DATETIME (Cell3D);
+cellTask (Cell3D c) = cellAlarm(c) AND NOT taskDone(c);   // активное задание на вывоз (ещё не выполнено)
+cellHint (Cell3D c) =
+    CASE
+        WHEN tempAlarm(c) THEN 'Температура вне нормы — проверить'
+        WHEN occupied(c) AND daysLeft(c) < 0 THEN 'Просрочено — срочно вывезти'
+        WHEN occupied(c) AND daysLeft(c) <= 3 THEN 'Истекает срок — приоритетный вывоз';
+
+// бизнес-слой: деньги под угрозой, назначение погрузчику (по зоне), приоритет, подпись
+valueAtRisk 'Сумма, ₽' (Cell3D c) = price(c) * qty(c) IF cellTask(c) AND occupied(c);
+forkOf (Cell3D c) = IF rackIndex(rack(c)) <= 3 THEN rackIndex(rack(c)) ELSE 3;
+prioVal (Cell3D c) = (
+        (IF tempAlarm(c) THEN 500000 ELSE 0)
+      + (OVERRIDE (0 - daysLeft(c)) * 1000, 0)
+      + (OVERRIDE valueAtRisk(c), 0)
+    ) IF cellTask(c);
+alarmLabelStr 'Проблема' (Cell3D c) =
+    CASE
+        WHEN tempAlarm(c) THEN 't° вне нормы'
+        WHEN daysLeft(c) < 0 THEN 'просроч. ' + (0 - daysLeft(c)) + 'д'
+        WHEN daysLeft(c) <= 3 THEN 'истекает ' + daysLeft(c) + 'д';
+alarmType (Cell3D c) = CASE WHEN tempAlarm(c) THEN 3 WHEN daysLeft(c) < 0 THEN 1 WHEN daysLeft(c) <= 3 THEN 2;
+
+// адрес ячейки под своим именем (иначе 'Адрес' автопереводится в 'Post address' на EN-локали)
+cellAddr 'Ячейка' (Cell3D c) = cellCode(c);
+// магазин-заказчик задания (имитация): детерминированно по номеру ячейки
+storeIdx (Cell3D c) = cellNum(c) - INTEGER(cellNum(c) / 6) * 6;
+storeNameOf 'Магазин' (Cell3D c) =
+    CASE
+        WHEN storeIdx(c) = 0 THEN 'Пятёрочка, Ленина 8'
+        WHEN storeIdx(c) = 1 THEN 'Магнит, Мира 14'
+        WHEN storeIdx(c) = 2 THEN 'Перекрёсток, ТЦ Аура'
+        WHEN storeIdx(c) = 3 THEN 'Дикси, Гагарина 3'
+        WHEN storeIdx(c) = 4 THEN 'ВкусВилл, Кирова 22'
+        ELSE 'Лента, Объездная 1';
+
+cellColor (Cell3D c) =
+    CASE
+        WHEN taskDone(c) THEN '#2e9b3e'
+        WHEN cellTask(c) THEN '#d23b3b'
+        WHEN device(c) THEN sensorColor(device(c))
+        WHEN occupied(c) THEN '#3a7bd5'
+        ELSE '#d7dde6';
+
+// ----- ворота -----
+CLASS Gate3D 'Ворота';
+TABLE gate3d (Gate3D);
+gWarehouse = DATA Scheme (Gate3D);
+gName 'Название' = DATA STRING[30] (Gate3D);
+gX = DATA INTEGER (Gate3D);
+gZ = DATA INTEGER (Gate3D);
+gNum = DATA INTEGER (Gate3D);
+gateRec (Gate3D g) = 'G^' + gNum(g) + '^' + gX(g) + '^' + gZ(g) + '^' + (OVERRIDE gName(g), '');
+gateRecs (Scheme w) = GROUP CONCAT gateRec(Gate3D g) IF gWarehouse(g) = w, '~' ORDER gNum(g);
+
+currentWh = DATA LOCAL Scheme ();
+firstWh () = GROUP MIN Scheme s IF kind(s) = 'wh';
+effWh () = OVERRIDE currentWh(), firstWh();
+theWarehouse () = effWh();
+
+// иерархия: залы (склады) — индекс зала
+whIndex (Scheme s) = PARTITION SUM (1 IF kind(s) = 'wh') ORDER name(s), s;
+curWhIndex () = whIndex(effWh());
+
+// статистика по складу (для обзора)
+whTasks 'Заданий' (Scheme w) = GROUP SUM 1 IF cellAlarm(Cell3D c) AND warehouse(rack(c)) = w;
+whExpired 'Просрочено' (Scheme w) = GROUP SUM 1 IF cellAlarm(Cell3D c) AND warehouse(rack(c)) = w AND daysLeft(c) < 0;
+whNear 'Скоро' (Scheme w) = GROUP SUM 1 IF cellAlarm(Cell3D c) AND warehouse(rack(c)) = w AND daysLeft(c) >= 0 AND NOT tempAlarm(c);
+whTemp 't°' (Scheme w) = GROUP SUM 1 IF tempAlarm(Cell3D c) AND warehouse(rack(c)) = w;
+whRisk 'Под угрозой, ₽' (Scheme w) = GROUP SUM valueAtRisk(Cell3D c) IF warehouse(rack(c)) = w;
+whFree 'Свободно' (Scheme w) = GROUP SUM 1 IF Cell3D c IS Cell3D AND warehouse(rack(c)) = w AND NOT occupied(c);
+// список залов с KPI для переключателя/обзора (после статистики складов)
+hallList () = GROUP CONCAT whIndex(Scheme s) + ':' + name(s) + ':' + (OVERRIDE ('' + whTasks(s)), '0') + ':' + (OVERRIDE ('' + whRisk(s)), '0') + ':' + (OVERRIDE ('' + whExpired(s)), '0') + ':' + (OVERRIDE ('' + whFree(s)), '0') IF kind(s) = 'wh', ';' ORDER whIndex(s);
+
+// KPI за сегодня (демо)
+tasksDoneToday 'Выполнено сегодня' = DATA INTEGER ();
+scrappedToday 'В утиль сегодня' = DATA INTEGER ();
+tasksOpen () = GROUP SUM 1 IF cellAlarm(Cell3D c);
+totalRiskAll () = GROUP SUM valueAtRisk(Cell3D c);
+
+rackRec (Rack3D r) = 'R^' + rackIndex(r) + '^' + posX(r) + '^' + posZ(r) + '^' + cols(r) + '^' + levels(r) + '^' + orient(r) + '^' + (OVERRIDE rackName(r), '');
+rackRecs (Scheme w) = GROUP CONCAT rackRec(Rack3D r) IF warehouse(r) = w, '~' ORDER rackIndex(r);
+
+cellRec (Cell3D c) = 'C^' + rackIndex(rack(c)) + '^' + col(c) + '^' + level(c) + '^' + (OVERRIDE cellColor(c), '#ccc') + '^' + cellNum(c) + '^' + (IF occupied(c) THEN 1 ELSE 0) + '^' + (IF cellTask(c) THEN 1 ELSE 0) + '^' + (OVERRIDE (forkOf(c) IF cellTask(c)), 0) + '^' + (OVERRIDE ('' + daysLeft(c)), '') + '^' + (OVERRIDE alarmLabelStr(c), '') + '^' + (OVERRIDE alarmType(c), 0) + '^' + (OVERRIDE sku(c), '') + '^' + (OVERRIDE storeNameOf(c), '') + '^' + (OVERRIDE ('' + (price(c) * qty(c))), '0') + '^' + (OVERRIDE ('' + expiry(c)), '') + '^' + (OVERRIDE ('' + qty(c)), '') + '^' + (OVERRIDE cellCode(c), '');
+// предохранитель: для огромных складов (напр. «Стройкино», 2000 ячеек) ограничиваем число ячеек в data-строке,
+// иначе сборка строки + рендер тысяч мешей роняют сервер по памяти (OOM). Демо-склады (<600) — без изменений.
+cellRank (Cell3D c) = PARTITION SUM 1 ORDER cellNum(c), c BY warehouse(rack(c));
+cellRecs (Scheme w) = GROUP CONCAT cellRec(Cell3D c) IF warehouse(rack(c)) = w AND cellRank(c) <= 600, '~' ORDER cellNum(c);
+
+// каталог сценариев инцидентов (определён до wh3dData, который его отдаёт в 3D)
+CLASS IncidentScenario 'Сценарий инцидента';
+TABLE incidentScenario (IncidentScenario);
+isKind 'Тип' = DATA STRING[10] (IncidentScenario);
+isCause 'Причина' = DATA ISTRING[120] (IncidentScenario) IN id;
+isRoot 'Корневая причина' = DATA ISTRING[200] (IncidentScenario);
+isRepair 'Действие техника' = DATA ISTRING[200] (IncidentScenario);
+isRisk 'Предотвращённый риск' = DATA ISTRING[150] (IncidentScenario);
+isMaterial 'Материал' = DATA ISTRING[60] (IncidentScenario);
+isMatQty 'Кол-во' = DATA INTEGER (IncidentScenario);
+scenRec (IncidentScenario s) = 'S^' + (OVERRIDE isKind(s), 'cold') + '^' + (OVERRIDE isCause(s), '') + '^' + (OVERRIDE isRoot(s), '') + '^' + (OVERRIDE isRepair(s), '') + '^' + (OVERRIDE isRisk(s), '') + '^' + (OVERRIDE isMaterial(s), '') + '^' + (OVERRIDE ('' + isMatQty(s)), '0');
+scenData () = GROUP CONCAT scenRec(IncidentScenario s), '~' ORDER s;
+
+// СПРАВОЧНИК ОБОРУДОВАНИЯ: тип → 3D-форма + набор датчиков + нормы + ЗИП + вид сценариев.
+// Универсально расширяет сцену: «добавить кондиционер/датчик/станок» = строка в справочнике.
+CLASS EquipmentType 'Тип оборудования';
+TABLE equipmentType (EquipmentType);
+etName 'Наименование' = DATA ISTRING[80] (EquipmentType) IN id;
+etShape 'Форма (3D)' = DATA STRING[12] (EquipmentType);   // machine | hvac | compressor | sensor | rack | conveyor
+etKind 'Сценарии (вид)' = DATA STRING[10] (EquipmentType); // откуда брать инциденты: machine | conveyor | cold | hum
+etTemp 'Датчик t°' = DATA BOOLEAN (EquipmentType);
+etVib 'Датчик вибрации' = DATA BOOLEAN (EquipmentType);
+etHum 'Датчик влажности' = DATA BOOLEAN (EquipmentType);
+etPowerS 'Датчик энергии' = DATA BOOLEAN (EquipmentType);
+etDoor 'Датчик двери' = DATA BOOLEAN (EquipmentType);
+etPowerKw 'Мощность, кВт' = DATA DOUBLE (EquipmentType);
+etVibMax 'Норма вибрации, мм/с' = DATA DOUBLE (EquipmentType);
+etMtbf 'Наработка до ТО, ч' = DATA INTEGER (EquipmentType);
+etSpare 'ЗИП' = DATA ISTRING[60] (EquipmentType);
+etSpareQty 'ЗИП на складе, шт' = DATA INTEGER (EquipmentType);
+etCount 'Кол-во в цехе/складе' = DATA INTEGER (EquipmentType);
+// компактная запись (9 полей) — держим близко к scenRec, чтобы не породить гигантский SQL
+equipRec (EquipmentType e) = 'E^' + (OVERRIDE etName(e), '') + '^' + (OVERRIDE etShape(e), 'machine') + '^' + (OVERRIDE etKind(e), 'machine')
+    + '^' + (OVERRIDE ('' + etPowerKw(e)), '0') + '^' + (OVERRIDE ('' + etVibMax(e)), '7') + '^' + (OVERRIDE ('' + etMtbf(e)), '0')
+    + '^' + (OVERRIDE etSpare(e), '') + '^' + (OVERRIDE ('' + etSpareQty(e)), '0') + '^' + (OVERRIDE ('' + etCount(e)), '0');
+equipData () = GROUP CONCAT equipRec(EquipmentType e), '~' ORDER etName(e), e;
+
+FORM equipmentTypes 'Справочник оборудования'
+    OBJECTS e = EquipmentType
+    PROPERTIES (e) etName, etShape, etKind, etCount, etTemp, etVib, etHum, etPowerS, etDoor, etPowerKw, etVibMax, etMtbf, etSpare, etSpareQty, NEW, DELETE
+;
+
+// ============================================================
+// ПРИВЯЗКА ОБЪЕКТОВ СЦЕНЫ К ДАННЫМ (механизм; колонки заполняются позже)
+// Экземпляр оборудования = строка в БД: тип → датчик (Device) → метрика → координаты/гео → источник sim/live.
+// Живое значение берётся из датчика, как у ячеек склада (prevLastValue); нет привязки — сцена симулирует.
+// ============================================================
+CLASS EquipmentUnit 'Оборудование объекта (экземпляр)';
+TABLE equipmentUnit (EquipmentUnit);
+euName 'Наименование' = DATA ISTRING[80] (EquipmentUnit) IN id;
+euScope 'Где' = DATA ISTRING[10] (EquipmentUnit);          // factory | warehouse
+euType 'Тип оборудования' = DATA EquipmentType (EquipmentUnit);
+nameEuType 'Тип оборудования' (EquipmentUnit u) = etName(euType(u));
+euGroup 'Линия/зона' = DATA ISTRING[40] (EquipmentUnit);
+euIndex 'Позиция №' = DATA INTEGER (EquipmentUnit);
+// раскладка на плане объекта
+euPosX 'X (план)' = DATA DOUBLE (EquipmentUnit);
+euPosY 'Y (план)' = DATA DOUBLE (EquipmentUnit);
+euPosZ 'Z (план)' = DATA DOUBLE (EquipmentUnit);
+// гео-координаты (карта объектов) — пусто сейчас
+euGeoLat 'Широта' = DATA DOUBLE (EquipmentUnit);
+euGeoLon 'Долгота' = DATA DOUBLE (EquipmentUnit);
+// привязка к КОНКРЕТНОМУ складу/объекту (Scheme) — куда физически стоит оборудование
+euWarehouse 'Склад/объект' = DATA Scheme (EquipmentUnit);
+nameEuWarehouse 'Склад/объект' (EquipmentUnit u) = name(euWarehouse(u));
+// ПРИВЯЗКА К ДАТЧИКУ (живые данные): выбираешь реальный Device (напр. 1210000003) + метрику
+euDevice 'Датчик (Device)' = DATA Device (EquipmentUnit);
+nameEuDevice 'Датчик (id)' (EquipmentUnit u) = STRING(id(euDevice(u)));
+euMeasure 'Метрика' = DATA MeasurementType (EquipmentUnit);
+euSource 'Источник' = DATA ISTRING[6] (EquipmentUnit);     // sim | live
+// живое значение из датчика (как schemeValue ячеек), иначе NULL → сцена берёт модель
+euLiveValue 'Текущее (live)' (EquipmentUnit u) = prevLastValue(euDevice(u), euMeasure(u)) IF euSource(u) = 'live' AND euDevice(u);
+
+equipTypeByShape (ISTRING[12] sh) = GROUP MAX EquipmentType e IF etShape(e) = sh;
+unitRec (EquipmentUnit u) = 'U^' + (OVERRIDE euName(u), '') + '^' + (OVERRIDE etShape(euType(u)), 'machine') + '^' + (OVERRIDE euGroup(u), '')
+    + '^' + (OVERRIDE ('' + euIndex(u)), '0') + '^' + (OVERRIDE euSource(u), 'sim')
+    + '^' + (OVERRIDE ('' + id(euDevice(u))), '') + '^' + (OVERRIDE ('' + euLiveValue(u)), '');
+unitData (ISTRING[10] scope) = GROUP CONCAT unitRec(EquipmentUnit u) IF euScope(u) = scope, '~' ORDER euGroup(u), euIndex(u), u;
+
+FORM equipmentUnits 'Оборудование объекта (привязка к данным)'
+    OBJECTS u = EquipmentUnit
+    PROPERTIES (u) euName, euScope, nameEuWarehouse, euWarehouse, nameEuType, euGroup, euIndex, euPosX, euPosY, euPosZ, euGeoLat, euGeoLon, nameEuDevice, euDevice, euMeasure, euSource, euLiveValue READONLY, NEW, DELETE
+;
+
+// создать экземпляр (идемпотентно по имени) — тип берётся по форме из справочника
+mkUnit (ISTRING[10] scope, ISTRING[80] nm, ISTRING[12] shape, ISTRING[40] grp, INTEGER ix, DOUBLE x, DOUBLE z) {
+    IF NOT (GROUP SUM 1 IF euName(EquipmentUnit u) = nm AND euScope(u) = scope) THEN
+        NEW u = EquipmentUnit { euName(u) <- nm; euScope(u) <- scope; euType(u) <- equipTypeByShape(shape); euGroup(u) <- grp; euIndex(u) <- ix; euPosX(u) <- x; euPosY(u) <- 0.0; euPosZ(u) <- z; euSource(u) <- 'sim'; }
+}
+// сид экземпляров под текущие сцены (привязка к Device/гео — пустая, заполнится позже)
+seedUnits () {
+    mkUnit('factory', 'Дозатор', 'machine', 'линия 1', 1, -60.0, -38.0);
+    mkUnit('factory', 'Смеситель', 'machine', 'линия 1', 2, 0.0, -38.0);
+    mkUnit('factory', 'Фасовка', 'machine', 'линия 1', 3, 60.0, -38.0);
+    mkUnit('factory', 'Упаковщик', 'machine', 'линия 2', 1, -60.0, 42.0);
+    mkUnit('factory', 'Этикетировщик', 'machine', 'линия 2', 2, 0.0, 42.0);
+    mkUnit('factory', 'Запайка', 'machine', 'линия 2', 3, 60.0, 42.0);
+    mkUnit('factory', 'Кондиционер / чиллер цеха #1', 'hvac', 'климат', 1, -120.0, -90.0);
+    mkUnit('factory', 'Кондиционер / чиллер цеха #2', 'hvac', 'климат', 2, 0.0, -90.0);
+    mkUnit('factory', 'Компрессор #3', 'compressor', 'климат', 3, 120.0, -90.0);
+    mkUnit('warehouse', 'Холодильный агрегат зоны A', 'compressor', 'зона A', 1, 20.0, 60.0);
+    mkUnit('warehouse', 'Холодильный агрегат зоны B', 'compressor', 'зона B', 2, 20.0, 120.0);
+    mkUnit('warehouse', 'Холодильный агрегат зоны C', 'compressor', 'зона C', 3, 20.0, 180.0);
+    APPLY;
+}
+
+// ЭКОНОМИКА: денежные параметры эффекта — настраиваются, не зашиты в код (источник всех ₽)
+ecoUnitPrice 'Цена ед. продукции, ₽' = DATA NUMERIC[14,2] ();
+ecoDowntimeRate 'Ставка простоя линии, ₽/ч' = DATA NUMERIC[14,2] ();
+ecoEnergyTariff 'Тариф энергии, ₽/кВт·ч' = DATA NUMERIC[14,2] ();
+ecoFineRisk 'Штраф за срыв поставки, ₽' = DATA NUMERIC[14,2] ();
+ecoSensorCapex 'Стоимость системы датчиков, ₽' = DATA NUMERIC[14,2] ();
+ecoRec () = 'ECO^' + (OVERRIDE ('' + ecoUnitPrice()), '480') + '^' + (OVERRIDE ('' + ecoDowntimeRate()), '12000')
+    + '^' + (OVERRIDE ('' + ecoEnergyTariff()), '7') + '^' + (OVERRIDE ('' + ecoFineRisk()), '150000') + '^' + (OVERRIDE ('' + ecoSensorCapex()), '450000');
+
+FORM economics 'Экономика (параметры эффекта)'
+    PROPERTIES () ecoUnitPrice, ecoDowntimeRate, ecoEnergyTariff, ecoFineRisk, ecoSensorCapex
+;
+
+// параметры цеха (для конструктора «Создать цех») — читаются клиентом из CFG-записи
+factName 'Название цеха' = DATA LOCAL ISTRING[80] ();
+factLines 'Линий' = DATA LOCAL INTEGER ();
+factPerLine 'Станков на линии' = DATA LOCAL INTEGER ();
+factCfg () = 'CFG^' + (OVERRIDE factName(), 'Цех') + '^' + (OVERRIDE ('' + factLines()), '2') + '^' + (OVERRIDE ('' + factPerLine()), '3');
+factoryData 'Цех' () = factCfg() + '~' + ecoRec() + (OVERRIDE '~' + equipData(), '') + (OVERRIDE '~' + unitData('factory'), '') + (OVERRIDE '~' + scenData(), '');
+
+wh3dData 'Склад 3D' () =
+    'W^' + (OVERRIDE name(theWarehouse()), 'Склад') + '^' + (OVERRIDE widthPx(theWarehouse()), 240) + '^' + (OVERRIDE heightPx(theWarehouse()), 140) + '^3^' + (OVERRIDE ('' + curWhIndex()), '1') + '^' + (OVERRIDE hallList(), '')
+  + (OVERRIDE '~' + rackRecs(theWarehouse()), '')
+  + (OVERRIDE '~' + gateRecs(theWarehouse()), '')
+  + (OVERRIDE '~' + cellRecs(theWarehouse()), '')
+  + '~' + ecoRec()
+  + (OVERRIDE '~' + equipData(), '')
+  + (OVERRIDE '~' + unitData('warehouse'), '')
+  + (OVERRIDE '~' + scenData(), '');
+
+selectedCell = DATA LOCAL Cell3D ();
+selInfo 'Выбрано' () =
+    (OVERRIDE 'Ячейка ' + cellCode(selectedCell()), 'кликни по ячейке')
+  + (OVERRIDE '  ·  ' + tempStr(schemeValue(device(selectedCell()))) + ' °C', '');
+
+// ============================================================
+// ERP-ЗАМЫКАНИЕ: инцидент → наряд ТОиР → списание ЗИП → заявка поставщику (реальные документы)
+// ============================================================
+CLASS Spare 'ЗИП (запчасть)';
+TABLE spare (Spare);
+spareName 'Наименование' = DATA ISTRING[60] (Spare);
+spareQty 'Остаток, шт' = DATA INTEGER (Spare);
+spareMin 'Мин. остаток' = DATA INTEGER (Spare);
+sparePrice 'Цена, ₽' = DATA NUMERIC[12,2] (Spare);
+spareByName = GROUP AGGR Spare s BY spareName(s);
+
+CLASS WorkOrder 'Наряд ТОиР';
+TABLE workOrder (WorkOrder);
+woNumber 'Номер' = DATA INTEGER (WorkOrder) IN id;
+woDate 'Дата/время' = DATA DATETIME (WorkOrder);
+woObject 'Объект' = DATA ISTRING[90] (WorkOrder);
+woCause 'Причина' = DATA ISTRING[120] (WorkOrder);
+woAction 'Выполнено' = DATA ISTRING[200] (WorkOrder);
+woRisk 'Предотвращённый риск' = DATA ISTRING[160] (WorkOrder);
+woSaved 'Эффект, ₽' = DATA NUMERIC[14,2] (WorkOrder);
+woSpare 'ЗИП' = DATA Spare (WorkOrder);
+nameWoSpare 'ЗИП' (WorkOrder w) = spareName(woSpare(w));
+woSpareQty 'Списано ЗИП' = DATA INTEGER (WorkOrder);
+woStatus 'Статус' = DATA ISTRING[20] (WorkOrder);
+
+CLASS PurchaseReq 'Заявка поставщику';
+TABLE purchaseReq (PurchaseReq);
+prNumber 'Номер' = DATA INTEGER (PurchaseReq) IN id;
+prDate 'Дата' = DATA DATETIME (PurchaseReq);
+prSpare 'ЗИП' = DATA Spare (PurchaseReq);
+namePrSpare 'ЗИП' (PurchaseReq r) = spareName(prSpare(r));
+prQty 'Кол-во' = DATA INTEGER (PurchaseReq);
+prStatus 'Статус' = DATA ISTRING[20] (PurchaseReq);
+
+woSeq = DATA INTEGER ();
+prSeq = DATA INTEGER ();
+
+// проводка: наряд + списание ЗИП со склада + авто-заявка при нехватке
+createWO (ISTRING[90] object, ISTRING[120] cause, ISTRING[200] act, ISTRING[160] risk, ISTRING[60] spare, INTEGER qty, INTEGER saved) {
+    woSeq() <- (OVERRIDE woSeq(), 1000) + 1;
+    LOCAL sp = Spare ();
+    IF spare != '' THEN {
+        sp() <- spareByName(spare);
+        IF NOT sp() THEN { NEW s = Spare { spareName(s) <- spare; spareQty(s) <- 3; spareMin(s) <- 2; sparePrice(s) <- 1500; sp() <- s; } }
+    }
+    NEW w = WorkOrder {
+        woNumber(w) <- woSeq(); woDate(w) <- currentDateTime(); woObject(w) <- object; woCause(w) <- cause;
+        woAction(w) <- act; woRisk(w) <- risk; woSaved(w) <- saved; woStatus(w) <- 'выполнен';
+        woSpare(w) <- sp(); woSpareQty(w) <- (qty IF sp());
+    }
+    IF sp() AND qty > 0 THEN {
+        spareQty(sp()) <- (OVERRIDE spareQty(sp()), 0) - qty;
+        IF spareQty(sp()) < (OVERRIDE spareMin(sp()), 0) THEN {
+            prSeq() <- (OVERRIDE prSeq(), 5000) + 1;
+            NEW r = PurchaseReq { prNumber(r) <- prSeq(); prDate(r) <- currentDateTime(); prSpare(r) <- sp(); prQty(r) <- (OVERRIDE spareMin(sp()), 2) * 3; prStatus(r) <- 'создана'; }
+        }
+    }
+}
+
+FORM spares 'ЗИП — склад запчастей'
+    OBJECTS s = Spare
+    PROPERTIES (s) spareName, spareQty, spareMin, sparePrice, NEW, DELETE
+;
+FORM workOrders 'Наряды ТОиР'
+    OBJECTS w = WorkOrder
+    PROPERTIES (w) READONLY woNumber, woDate, woObject, woCause, woAction, nameWoSpare, woSpareQty, woRisk, woSaved, woStatus
+;
+FORM purchaseReqs 'Заявки поставщику'
+    OBJECTS r = PurchaseReq
+    PROPERTIES (r) READONLY prNumber, prDate, namePrSpare, prQty, prStatus
+;
+
+// обработчик событий цеха (наряд от сцены)
+onFactoryEvent () {
+    INPUT j = JSON DO
+        IMPORT JSON FROM j FIELDS() STRING action, ISTRING[90] object, ISTRING[120] cause, ISTRING[200] act, ISTRING[160] risk, ISTRING[60] spare, INTEGER qty, INTEGER saved DO {
+            IF action = 'workorder' THEN { createWO(object, cause, act, risk, spare, qty, saved); APPLY; }
+        }
+}
+
+onWh3dEvent () {
+    INPUT f = JSON DO
+        IMPORT JSON FROM f FIELDS() STRING action, INTEGER n, ISTRING[90] object, ISTRING[120] cause, ISTRING[200] act, ISTRING[160] risk, ISTRING[60] spare, INTEGER qty, INTEGER saved DO {
+            IF action = 'cell' THEN selectedCell() <- GROUP MAX Cell3D c IF cellNum(c) = n;
+            IF action = 'hall' THEN currentWh() <- GROUP MAX Scheme s IF whIndex(s) = n AND kind(s) = 'wh';
+            IF action = 'workorder' THEN { createWO(object, cause, act, risk, spare, qty, saved); APPLY; }
+        }
+}
+
+// --- карточка датчика выбранной ячейки + мини-график ---
+selDev () = device(selectedCell());
+selTemp () = schemeValue(selDev());
+selMinV () = minReportFixedValue(selDev(), temperatureType());
+selMaxV () = maxReportFixedValue(selDev(), temperatureType());
+
+mDev (Measurement m) = device(m, temperatureType());
+mVal (Measurement m) = value(m, temperatureType());
+selCount () = GROUP SUM 1 IF mDev(Measurement m) = selDev();
+selRank (Measurement m) = PARTITION SUM 1 ORDER dateTime(m), m IF mDev(m) = selDev();
+SPN () = 40;
+spWin (Measurement m) = selRank(m) - (selCount() - SPN());   // 1..SPN для последних точек
+spYmin () = OVERRIDE selMinV() - 2.0, 0.0;
+spYmax () = OVERRIDE selMaxV() + 2.0, 30.0;
+spX (Measurement m) = spWin(m) * 7.0;
+spY (Measurement m) = 78.0 - (mVal(m) - spYmin()) / (spYmax() - spYmin()) * 64.0;
+spPoints () = GROUP CONCAT (spX(Measurement m) + ',' + spY(m)) IF spWin(m) >= 1 AND spWin(m) <= SPN(), ' ' ORDER spWin(m);
+spLine (DOUBLE v) = 78.0 - (v - spYmin()) / (spYmax() - spYmin()) * 64.0;
+
+cardHTML 'Карточка' () = HTML(
+    '<div style="font-family:sans-serif;padding:12px;min-width:300px">'
+  + '<div style="font-size:12px;color:#8a93a0">Ячейка</div>'
+  + '<div style="font-size:20px;font-weight:700;color:#222">' + (OVERRIDE cellCode(selectedCell()), '—') + '</div>'
+  + (OVERRIDE '<div style="margin-top:8px;font-size:15px;color:#222"><b>' + sku(selectedCell()) + '</b> · ' + qty(selectedCell()) + ' шт</div>', '<div style="margin-top:8px;color:#8a93a0;font-size:13px">ячейка пуста</div>')
+  + (OVERRIDE '<div style="font-size:12px;color:#667">годен до ' + expiry(selectedCell()) + '  ·  осталось ' + daysLeft(selectedCell()) + ' дн.</div>', '')
+  + (OVERRIDE '<div style="margin-top:8px;padding:7px 9px;background:#fdecec;color:#b3261e;border-radius:5px;font-size:13px;font-weight:600">⚠ ' + cellHint(selectedCell()) + '</div>', '')
+  + (OVERRIDE
+        '<div style="margin-top:12px;font-size:12px;color:#8a93a0">Датчик ' + id(selDev()) + '</div>'
+      + '<div style="font-size:34px;font-weight:800;color:' + (OVERRIDE sensorColor(selDev()), '#999') + '">' + (OVERRIDE tempStr(selTemp()), '—') + ' °C</div>'
+      + '<div style="font-size:12px;color:#667">норма ' + (OVERRIDE tempStr(selMinV()), '?') + ' … ' + (OVERRIDE tempStr(selMaxV()), '?') + ' °C</div>'
+      + '<svg width="294" height="88" style="margin-top:10px;background:#fafbfc;border:1px solid #e6e9ee;border-radius:5px">'
+      + '<line x1="0" y1="' + (OVERRIDE spLine(selMaxV()), 6.0) + '" x2="294" y2="' + (OVERRIDE spLine(selMaxV()), 6.0) + '" stroke="#edb4b4" stroke-dasharray="4 4"/>'
+      + '<line x1="0" y1="' + (OVERRIDE spLine(selMinV()), 80.0) + '" x2="294" y2="' + (OVERRIDE spLine(selMinV()), 80.0) + '" stroke="#edb4b4" stroke-dasharray="4 4"/>'
+      + '<polyline points="' + (OVERRIDE spPoints(), '') + '" fill="none" stroke="#3a7bd5" stroke-width="2"/>'
+      + '</svg>'
+      , '')
+  + '</div>');
+
+onWebClientInit() + {
+    onWebClientInit('three.min.js') <- 3;
+    onWebClientInit('warehouse3d.js') <- 4;
+    onWebClientInit('factory3d.js') <- 5;
+}
+
+forkColorHex (INTEGER i) = CASE WHEN i = 1 THEN '#e0a800' WHEN i = 2 THEN '#1f9d6b' ELSE '#3a7bd5';
+taskCount () = whTasks(effWh());
+totalRisk () = whRisk(effWh());
+
+// ----- real-time: выполнение заданий, экономия/потери -----
+rtDone () = GROUP SUM 1 IF taskDone(Cell3D c) AND warehouse(rack(c)) = effWh();
+rtActive () = GROUP SUM 1 IF cellTask(Cell3D c) AND warehouse(rack(c)) = effWh();
+rtTotal () = (OVERRIDE rtDone(), 0) + (OVERRIDE rtActive(), 0);
+rtSaved () = GROUP SUM (price(Cell3D c) * qty(c)) IF taskDone(c) AND warehouse(rack(c)) = effWh();
+rtLoss () = GROUP SUM (price(Cell3D c) * qty(c)) IF cellTask(c) AND daysLeft(c) < 0 AND warehouse(rack(c)) = effWh();
+rtPct () = IF rtTotal() > 0 THEN round0(rtDone() * 100.0 / rtTotal()) ELSE 0;
+forkBadge 'Погрузчик' (Cell3D c) = 'П' + forkOf(c);
+
+markDone 'Выполнить ✓' (Cell3D c) { taskDone(c) <- TRUE; doneTime(c) <- currentDateTime(); APPLY; }
+markDoneSel 'Выполнить выбранное ✓' () { IF cellTask(selectedCell()) THEN { taskDone(selectedCell()) <- TRUE; doneTime(selectedCell()) <- currentDateTime(); APPLY; } }
+
+rtPanel 'Реальное время' () = HTML(
+    '<div style="font-family:sans-serif;padding:12px 14px">'
+  + '<div style="font-size:15px;font-weight:700;color:#222;margin-bottom:10px">Цифровой склад — сейчас</div>'
+  + '<div style="display:flex;gap:16px;flex-wrap:wrap">'
+    + '<div><div style="font-size:11px;color:#8a93a0">Выполнено</div><div style="font-size:23px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + rtDone()), '0') + ' / ' + (OVERRIDE ('' + rtTotal()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Готовность</div><div style="font-size:23px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + rtPct()), '0') + '%</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Сэкономлено</div><div style="font-size:23px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + rtSaved()), '0') + ' ₽</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Потери</div><div style="font-size:23px;font-weight:800;color:#b3261e">' + (OVERRIDE ('' + rtLoss()), '0') + ' ₽</div></div>'
+  + '</div></div>');
+
+FORM warehouse3d 'Цифровой склад'
+    PROPERTIES wh3dData() CUSTOM 'warehouse3d' ON CHANGE onWh3dEvent()
+;
+
+DESIGN warehouse3d {
+    MOVE PROPERTY(wh3dData()) { fill = 1; caption = ''; }
+}
+
+FORM factory3d 'Цех (производство)'
+    PROPERTIES factoryData() CUSTOM 'factory3d' ON CHANGE onFactoryEvent()
+;
+DESIGN factory3d {
+    MOVE PROPERTY(factoryData()) { fill = 1; caption = ''; }
+}
+
+// ============================================================
+// «Придумай как» — обзор всех складов + проваливание в 3D
+// ============================================================
+kpiPanel 'Сводка дня' () = HTML(
+    '<div style="font-family:sans-serif;padding:14px 16px;display:flex;gap:26px;flex-wrap:wrap">'
+  + '<div><div style="font-size:11px;color:#8a93a0">Открыто задач</div><div style="font-size:28px;font-weight:800;color:#b3261e">' + (OVERRIDE ('' + tasksOpen()), '0') + '</div></div>'
+  + '<div><div style="font-size:11px;color:#8a93a0">Под угрозой</div><div style="font-size:28px;font-weight:800;color:#222">' + (OVERRIDE ('' + totalRiskAll()), '0') + ' ₽</div></div>'
+  + '<div><div style="font-size:11px;color:#8a93a0">Выполнено сегодня</div><div style="font-size:28px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + tasksDoneToday()), '0') + '</div></div>'
+  + '<div><div style="font-size:11px;color:#8a93a0">В утиль сегодня</div><div style="font-size:28px;font-weight:800;color:#a06a00">' + (OVERRIDE ('' + scrappedToday()), '0') + '</div></div>'
+  + '</div>');
+
+open3D 'Открыть 3D' (Scheme w) { currentWh() <- w; SHOW warehouse3d; }
+
+FORM facilityOverview 'Придумай как'
+    PROPERTIES kpiPanel()
+    OBJECTS w = Scheme
+    PROPERTIES (w) READONLY name, whTasks, whExpired, whNear, whTemp, whRisk, whFree
+    PROPERTIES open3D(w)
+    FILTERS kind(w) = 'wh'
+    ORDERS name(w)
+;
+
+DESIGN facilityOverview {
+    NEW kpi { MOVE PROPERTY(kpiPanel()); }
+    MOVE BOX(w) { fill = 1; caption = 'Склады'; }
+}
+
+// ============================================================
+// СПРАВОЧНИКИ (универсализация: правила/нормы задаются данными)
+// ============================================================
+CLASS ProductProfile 'Профиль продукции';
+TABLE productProfile (ProductProfile);
+ppName 'Тип продукции' = DATA ISTRING[80] (ProductProfile) IN id;
+ppTempMin 'Норма t° от' = DATA INTEGER (ProductProfile);
+ppTempMax 'Норма t° до' = DATA INTEGER (ProductProfile);
+ppHum 'Влажность, %' = DATA INTEGER (ProductProfile);
+ppEth 'Этилен-чувств.' = DATA BOOLEAN (ProductProfile);
+ppShelf 'Срок, дн' = DATA INTEGER (ProductProfile);
+
+FORM productProfiles 'Профили продукции'
+    OBJECTS p = ProductProfile
+    PROPERTIES (p) ppName, ppTempMin, ppTempMax, ppHum, ppEth, ppShelf, NEW, DELETE
+;
+
+FORM incidentScenarios 'Каталог сценариев инцидентов'
+    OBJECTS s = IncidentScenario
+    PROPERTIES (s) isKind, isCause, isRoot, isRepair, isRisk, isMaterial, isMatQty, NEW, DELETE
+;
+
+// добавить сценарий, если такого ещё нет (идемпотентно, по причине) — позволяет докидывать сценарии без сброса БД
+ensureScen (ISTRING[10] kind, ISTRING[120] cause, ISTRING[200] root, ISTRING[200] repair, ISTRING[150] risk, ISTRING[60] mat, INTEGER qty) {
+    IF NOT (GROUP SUM 1 IF isCause(IncidentScenario s) = cause) THEN
+        NEW s = IncidentScenario { isKind(s) <- kind; isCause(s) <- cause; isRoot(s) <- root; isRepair(s) <- repair; isRisk(s) <- risk; isMaterial(s) <- mat; isMatQty(s) <- qty; }
+}
+
+// идемпотентный сид справочников
+seedCatalogs () {
+    IF NOT (GROUP SUM 1 IF ProductProfile pp IS ProductProfile) THEN {
+        NEW p = ProductProfile { ppName(p) <- 'Охлаждёнка'; ppTempMin(p) <- 0; ppTempMax(p) <- 4; ppHum(p) <- 85; ppEth(p) <- NULL; ppShelf(p) <- 10; }
+        NEW p = ProductProfile { ppName(p) <- 'Фрукты/овощи'; ppTempMin(p) <- 0; ppTempMax(p) <- 8; ppHum(p) <- 90; ppEth(p) <- TRUE; ppShelf(p) <- 7; }
+        NEW p = ProductProfile { ppName(p) <- 'Заморозка'; ppTempMin(p) <- -22; ppTempMax(p) <- -15; ppHum(p) <- 70; ppEth(p) <- NULL; ppShelf(p) <- 180; }
+    }
+    IF NOT (GROUP SUM 1 IF IncidentScenario ss IS IncidentScenario) THEN {
+        NEW s = IncidentScenario { isKind(s) <- 'cold'; isCause(s) <- 'Засор фильтров холодильника'; isRoot(s) <- 'загрязнились фильтры конденсатора, упал теплосъём'; isRepair(s) <- 'замена фильтров, чистка конденсатора'; isRisk(s) <- 'перегрев и поломка мотора — 75%'; isMaterial(s) <- 'фильтры'; isMatQty(s) <- 2; }
+        NEW s = IncidentScenario { isKind(s) <- 'cold'; isCause(s) <- 'Утечка хладагента'; isRoot(s) <- 'микротечь в контуре, давление упало'; isRepair(s) <- 'устранена течь, дозаправка R404'; isRisk(s) <- 'полный отказ компрессора — 60%'; isMaterial(s) <- 'хладагент R404'; isMatQty(s) <- 1; }
+        NEW s = IncidentScenario { isKind(s) <- 'cold'; isCause(s) <- 'Обледенение испарителя'; isRoot(s) <- 'забит дренаж, наморозило испаритель'; isRepair(s) <- 'разморозка и прочистка дренажа'; isRisk(s) <- 'блокировка воздуха, рост t° — 50%'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+        NEW s = IncidentScenario { isKind(s) <- 'cold'; isCause(s) <- 'Просадка напряжения'; isRoot(s) <- 'скачок в сети, сработала защита компрессора'; isRepair(s) <- 'перезапуск, проверка автоматики'; isRisk(s) <- 'выход из строя пускателя — 40%'; isMaterial(s) <- 'пусковое реле'; isMatQty(s) <- 1; }
+        NEW s = IncidentScenario { isKind(s) <- 'cold'; isCause(s) <- 'Дверь камеры приоткрыта'; isRoot(s) <- 'не сработал доводчик двери'; isRepair(s) <- 'регулировка доводчика, инструктаж смены'; isRisk(s) <- 'наплыв тепла и порча — высокий'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+        NEW s = IncidentScenario { isKind(s) <- 'cold'; isCause(s) <- 'Дрейф датчика температуры'; isRoot(s) <- 'показания датчика ушли — нужна поверка'; isRepair(s) <- 'поверка и замена датчика'; isRisk(s) <- 'ложные/пропущенные тревоги'; isMaterial(s) <- 'датчик MITE'; isMatQty(s) <- 1; }
+        NEW s = IncidentScenario { isKind(s) <- 'eth'; isCause(s) <- 'Этилен от соседней партии'; isRoot(s) <- 'зелёные бананы ускорили дозревание соседних фруктов'; isRepair(s) <- 'партии разнесены, усилена вентиляция'; isRisk(s) <- 'ускоренная порча партии — высокий'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+        NEW s = IncidentScenario { isKind(s) <- 'hum'; isCause(s) <- 'Конденсат, рост влажности'; isRoot(s) <- 'перепад температур дал конденсат'; isRepair(s) <- 'осушение, настройка вентиляции'; isRisk(s) <- 'плесень и потеря качества'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+    }
+    IF NOT (GROUP SUM 1 IF isKind(IncidentScenario sm) = 'machine') THEN {
+        NEW s = IncidentScenario { isKind(s) <- 'machine'; isCause(s) <- 'Износ подшипника'; isRoot(s) <- 'рост вибрации, выработка подшипникового узла'; isRepair(s) <- 'замена подшипника, центровка вала'; isRisk(s) <- 'заклинивание и поломка двигателя — 80%'; isMaterial(s) <- 'подшипник'; isMatQty(s) <- 2; }
+        NEW s = IncidentScenario { isKind(s) <- 'machine'; isCause(s) <- 'Перегрев двигателя'; isRoot(s) <- 'превышение тока, недостаточное охлаждение'; isRepair(s) <- 'чистка, проверка обмоток, восстановление обдува'; isRisk(s) <- 'выгорание обмотки — 65%'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+        NEW s = IncidentScenario { isKind(s) <- 'machine'; isCause(s) <- 'Дисбаланс ротора'; isRoot(s) <- 'налипание/износ — биение ротора'; isRepair(s) <- 'балансировка ротора'; isRisk(s) <- 'разрушение крепления — 50%'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+        NEW s = IncidentScenario { isKind(s) <- 'machine'; isCause(s) <- 'Ослабло крепление'; isRoot(s) <- 'вибрация ослабила болтовые соединения'; isRepair(s) <- 'протяжка креплений, контроль момента'; isRisk(s) <- 'смещение узла — 40%'; isMaterial(s) <- 'крепёж'; isMatQty(s) <- 1; }
+    }
+    IF NOT (GROUP SUM 1 IF isKind(IncidentScenario sc) = 'conveyor') THEN {
+        NEW s = IncidentScenario { isKind(s) <- 'conveyor'; isCause(s) <- 'Проскальзывание ленты'; isRoot(s) <- 'упало натяжение/износ приводного барабана'; isRepair(s) <- 'натяжка ленты, проверка барабана'; isRisk(s) <- 'остановка линии и срыв плана — высокий'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+        NEW s = IncidentScenario { isKind(s) <- 'conveyor'; isCause(s) <- 'Повреждение ленты'; isRoot(s) <- 'надрыв/расслоение полотна'; isRepair(s) <- 'вулканизация стыка / замена секции'; isRisk(s) <- 'обрыв и простой — высокий'; isMaterial(s) <- 'лента, секция'; isMatQty(s) <- 1; }
+        NEW s = IncidentScenario { isKind(s) <- 'conveyor'; isCause(s) <- 'Засор на линии'; isRoot(s) <- 'затор продукции на участке'; isRepair(s) <- 'расчистка, настройка датчиков подачи'; isRisk(s) <- 'брак и простой'; isMaterial(s) <- ''; isMatQty(s) <- 0; }
+    }
+    // --- доп. сценарии (докидываются и в уже залитую БД) ---
+    ensureScen('machine', 'Деградация смазки редуктора', 'упала вязкость смазки, рост трения и температуры', 'замена смазки, ревизия редуктора', 'задир шестерён — 55%', 'смазка', 2);
+    ensureScen('machine', 'Износ приводного ремня', 'растяжение и трещины ремня привода', 'замена ремня, регулировка натяжения', 'обрыв ремня и простой — 60%', 'ремень', 1);
+    ensureScen('machine', 'Перегрев подшипникового узла', 'недостаток смазки, рост температуры узла', 'смазка узла, контроль зазора', 'заклинивание — 50%', 'смазка', 1);
+    ensureScen('machine', 'Биение шпинделя', 'выработка опоры шпинделя', 'замена опоры, юстировка', 'потеря точности и брак — 45%', 'опора шпинделя', 1);
+    ensureScen('conveyor', 'Растяжение тяговой цепи', 'износ звеньев, провисание цепи', 'перетяжка/замена секции цепи, смазка', 'соскок цепи и остановка — высокий', 'звено цепи', 2);
+    ensureScen('conveyor', 'Увод полотна вбок', 'разная натяжка краёв, полотно уводит', 'центровка роликов, выравнивание натяжения', 'кромочный износ и обрыв — средний', '', 0);
+    ensureScen('conveyor', 'Заклинивание опорного ролика', 'разрушился подшипник ролика', 'замена ролика', 'локальный износ ленты — средний', 'ролик', 2);
+    ensureScen('conveyor', 'Сбой датчика позиционирования', 'загрязнение/расстройка оптического датчика', 'чистка/замена датчика, калибровка', 'сбой подачи и брак — средний', 'датчик', 1);
+    ensureScen('cold', 'Отказ вентилятора испарителя', 'заклинил двигатель вентилятора обдува', 'замена вентилятора испарителя', 'падение теплосъёма, рост t° — 70%', 'вентилятор', 1);
+    ensureScen('cold', 'Залипание ТРВ', 'терморегулирующий вентиль заклинило', 'прочистка/замена ТРВ, настройка перегрева', 'неустойчивый режим, недоохлаждение — 55%', 'ТРВ', 1);
+    ensureScen('eth', 'Задержка отгрузки — перезревание', 'партия задержана, ускорилось дозревание', 'приоритет отгрузки, изоляция партии', 'списание перезревшей партии — высокий', '', 0);
+    ensureScen('hum', 'Отказ осушителя воздуха', 'осушитель не выходит на режим', 'ремонт/замена осушителя', 'рост влажности и плесень — средний', '', 0);
+    // --- справочник оборудования (типы агрегатов с датчиками и нормами) ---
+    IF NOT (GROUP SUM 1 IF EquipmentType e IS EquipmentType) THEN {
+        NEW e = EquipmentType { etName(e) <- 'Станок (агрегат линии)'; etShape(e) <- 'machine'; etKind(e) <- 'machine'; etVib(e) <- TRUE; etTemp(e) <- TRUE; etPowerS(e) <- TRUE; etPowerKw(e) <- 7.5; etVibMax(e) <- 7.0; etMtbf(e) <- 2000; etSpare(e) <- 'подшипник'; etSpareQty(e) <- 6; etCount(e) <- 6; }
+        NEW e = EquipmentType { etName(e) <- 'Конвейер (лента)'; etShape(e) <- 'conveyor'; etKind(e) <- 'conveyor'; etVib(e) <- TRUE; etPowerS(e) <- TRUE; etPowerKw(e) <- 3.0; etVibMax(e) <- 6.0; etMtbf(e) <- 4000; etSpare(e) <- 'ролик/лента'; etSpareQty(e) <- 3; etCount(e) <- 2; }
+        NEW e = EquipmentType { etName(e) <- 'Кондиционер / чиллер цеха'; etShape(e) <- 'hvac'; etKind(e) <- 'cold'; etVib(e) <- TRUE; etTemp(e) <- TRUE; etPowerS(e) <- TRUE; etPowerKw(e) <- 12.0; etVibMax(e) <- 6.5; etMtbf(e) <- 1500; etSpare(e) <- 'фильтры'; etSpareQty(e) <- 4; etCount(e) <- 2; }
+        NEW e = EquipmentType { etName(e) <- 'Компрессор'; etShape(e) <- 'compressor'; etKind(e) <- 'cold'; etVib(e) <- TRUE; etTemp(e) <- TRUE; etPowerS(e) <- TRUE; etPowerKw(e) <- 15.0; etVibMax(e) <- 7.0; etMtbf(e) <- 1800; etSpare(e) <- 'хладагент R404'; etSpareQty(e) <- 2; etCount(e) <- 1; }
+        NEW e = EquipmentType { etName(e) <- 'Датчик-узел (t°/влажность)'; etShape(e) <- 'sensor'; etKind(e) <- 'cold'; etTemp(e) <- TRUE; etHum(e) <- TRUE; etPowerKw(e) <- 0.0; etVibMax(e) <- 0.0; etMtbf(e) <- 8760; etSpare(e) <- 'датчик MITE'; etSpareQty(e) <- 10; etCount(e) <- 8; }
+        NEW e = EquipmentType { etName(e) <- 'Стеллаж'; etShape(e) <- 'rack'; etKind(e) <- 'cold'; etPowerKw(e) <- 0.0; etVibMax(e) <- 0.0; etMtbf(e) <- 0; etSpare(e) <- ''; etSpareQty(e) <- 0; etCount(e) <- 0; }
+    }
+    // экономика по умолчанию (источник всех ₽ в сценах)
+    IF NOT ecoUnitPrice() THEN { ecoUnitPrice() <- 480; ecoDowntimeRate() <- 12000; ecoEnergyTariff() <- 7; ecoFineRisk() <- 150000; ecoSensorCapex() <- 450000; }
+    // склад ЗИП (для нарядов ТОиР — реальное списание/заявки)
+    IF NOT (GROUP SUM 1 IF Spare sp IS Spare) THEN {
+        NEW s = Spare { spareName(s) <- 'подшипник'; spareQty(s) <- 6; spareMin(s) <- 3; sparePrice(s) <- 2200; }
+        NEW s = Spare { spareName(s) <- 'фильтры'; spareQty(s) <- 8; spareMin(s) <- 4; sparePrice(s) <- 900; }
+        NEW s = Spare { spareName(s) <- 'хладагент R404'; spareQty(s) <- 3; spareMin(s) <- 2; sparePrice(s) <- 4200; }
+        NEW s = Spare { spareName(s) <- 'ремень'; spareQty(s) <- 4; spareMin(s) <- 2; sparePrice(s) <- 1300; }
+        NEW s = Spare { spareName(s) <- 'смазка'; spareQty(s) <- 10; spareMin(s) <- 4; sparePrice(s) <- 600; }
+        NEW s = Spare { spareName(s) <- 'ролик/лента'; spareQty(s) <- 3; spareMin(s) <- 2; sparePrice(s) <- 3100; }
+        NEW s = Spare { spareName(s) <- 'крепёж'; spareQty(s) <- 20; spareMin(s) <- 6; sparePrice(s) <- 150; }
+        NEW s = Spare { spareName(s) <- 'датчик MITE'; spareQty(s) <- 10; spareMin(s) <- 4; sparePrice(s) <- 2800; }
+    }
+    // проставить «Кол-во» по умолчанию и для уже залитых типов (идемпотентно)
+    FOR EquipmentType e IS EquipmentType AND NOT etCount(e) DO
+        etCount(e) <- (CASE WHEN etShape(e) = 'hvac' THEN 2 WHEN etShape(e) = 'compressor' THEN 1 WHEN etShape(e) = 'sensor' THEN 8 WHEN etShape(e) = 'machine' THEN 6 WHEN etShape(e) = 'conveyor' THEN 2 ELSE 1);
+    APPLY;
+    seedUnits();   // экземпляры — после APPLY типов (иначе equipTypeByShape не видит типы)
+}
+onStarted() + { seedCatalogs(); }
+
+// ============================================================
+// ГЕНЕРАТОР ОБЪЕКТА по параметрам → пишет Scheme/Rack/Cell, 3D строится сам
+// ============================================================
+genName 'Название склада' = DATA LOCAL ISTRING[80] ();
+genZones 'Зон (камер)' = DATA LOCAL INTEGER ();
+genCols 'Секций в стеллаже' = DATA LOCAL INTEGER ();
+genLevels 'Ярусов' = DATA LOCAL INTEGER ();
+zoneLetter (INTEGER i) = CASE WHEN i = 1 THEN 'A' WHEN i = 2 THEN 'B' WHEN i = 3 THEN 'C' WHEN i = 4 THEN 'D' WHEN i = 5 THEN 'E' ELSE 'F';
+
+generateWarehouse 'Создать склад' () {
+    LOCAL nz = INTEGER (); nz() <- OVERRIDE genZones(), 3;
+    LOCAL nc = INTEGER (); nc() <- OVERRIDE genCols(), 4;
+    LOCAL nl = INTEGER (); nl() <- OVERRIDE genLevels(), 3;
+    LOCAL zi = INTEGER (); LOCAL ci = INTEGER (); LOCAL li = INTEGER ();
+    NEW w = Scheme {
+        name(w) <- OVERRIDE genName(), 'Новый склад';
+        kind(w) <- 'wh';
+        widthPx(w) <- nc() * 18 + 80;
+        heightPx(w) <- nz() * 60 + 40;
+        zi() <- 1;
+        WHILE zi() <= nz() DO {
+            NEW r = Rack3D {
+                warehouse(r) <- w; rackIndex(r) <- zi(); rackName(r) <- zoneLetter(zi());
+                posX(r) <- 20; posZ(r) <- zi() * 60; cols(r) <- nc(); levels(r) <- nl(); orient(r) <- 0;
+                ci() <- 0;
+                WHILE ci() < nc() DO {
+                    li() <- 0;
+                    WHILE li() < nl() DO {
+                        NEW c = Cell3D {
+                            rack(c) <- r; col(c) <- ci(); level(c) <- li(); occupied(c) <- TRUE;
+                            cellNum(c) <- zi() * 100 + ci() * 10 + li();
+                            cellCode(c) <- zoneLetter(zi()) + '-' + (ci() + 1) + '-' + (li() + 1);
+                            qty(c) <- 10 + ci() * 5; price(c) <- 8000 + ci() * 9000 + li() * 6000;
+                            expiry(c) <- sum(currentDate(), 2 + ci() * 3 + li() * 4 - 3);
+                            sku(c) <- (CASE WHEN zi() = 1 THEN 'Молочка' WHEN zi() = 2 THEN 'Фрукты/овощи' ELSE 'Заморозка');
+                        }
+                        li() <- li() + 1;
+                    }
+                    ci() <- ci() + 1;
+                }
+            }
+            zi() <- zi() + 1;
+        }
+        NEW g = Gate3D { gWarehouse(g) <- w; gNum(g) <- 1; gX(g) <- nc() * 18 / 2; gZ(g) <- nz() * 60 + 30; gName(g) <- 'Ворота'; }
+        currentWh() <- w;
+    }
+    APPLY;
+    SHOW warehouse3d;
+}
+
+// генерация цеха: цех строится клиентом процедурно, поэтому достаточно задать параметры (LOCAL) и открыть форму
+generateFactory 'Создать цех' () { SHOW factory3d; }
+
+FORM facilityBuilder 'Конструктор объектов'
+    PROPERTIES () genName, genZones, genCols, genLevels, generateWarehouse
+    PROPERTIES () factName, factLines, factPerLine, generateFactory
+;
+
+DESIGN facilityBuilder {
+    NEW row {
+        horizontal = TRUE;
+        NEW whBox {
+            caption = 'Склад 3D — по параметрам';
+            MOVE PROPERTY(genName()); MOVE PROPERTY(genZones()); MOVE PROPERTY(genCols()); MOVE PROPERTY(genLevels());
+            MOVE PROPERTY(generateWarehouse());
+        }
+        NEW fcBox {
+            caption = 'Цех 3D — по параметрам';
+            MOVE PROPERTY(factName()); MOVE PROPERTY(factLines()); MOVE PROPERTY(factPerLine());
+            MOVE PROPERTY(generateFactory());
+        }
+    }
+}
+
+NAVIGATOR {
+    monitoring {
+        NEW FOLDER visualization 'Визуализация' FIRST {
+            NEW warehouse3d;
+            NEW factory3d;
+            MOVE dashboards;
+        }
+        NEW FOLDER catalogs 'Мастер-данные' {
+            NEW productProfiles;
+            NEW equipmentTypes;
+            NEW equipmentUnits;
+            NEW economics;
+            NEW incidentScenarios;
+            NEW facilityBuilder;
+        }
+        NEW FOLDER maintenance 'ТОиР и ЗИП' {
+            NEW workOrders;
+            NEW spares;
+            NEW purchaseReqs;
+        }
+    }
+}
