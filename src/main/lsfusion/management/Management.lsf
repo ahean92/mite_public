@@ -688,7 +688,11 @@ EXTEND FORM controllerManagers
 
 overChangedNames = ABSTRACT VALUE BOOLEAN (Management);
 changedNames(Management m) = CHANGED (onMessage(m)) OR CHANGED (offMessage(m)) OR CHANGED(name(m)) OR overChangedNames(m);
-WHEN CHANGED (deviceName(ControllerManager cp)) OR changedNames(template(cp)) OR changedNames(cp AS ControllerManager) DO
+// Только для управлений, созданных по шаблону: copyNames берёт имена из template(cp),
+// и без шаблона он затирает в NULL и name, и всё, что навешано на overCopyNames
+// (Mite: inReport, adjustValues) — стоит один раз тронуть управление, заведённое руками.
+WHEN template(ControllerManager cp)
+        AND (CHANGED (deviceName(cp)) OR changedNames(template(cp)) OR changedNames(cp AS ControllerManager)) DO
     copyNames(template(cp), cp);
 
 changed (Management m) = (GROUP SUM 1 IF CHANGED (in(ManagerTo mto, m))) OR
