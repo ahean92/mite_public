@@ -4,6 +4,13 @@ REQUIRE Controller, Device, Geo, Measurement, Hierarchy, SystemEvents;
 
 CLASS Location 'Точка размещения' : POI;
 name 'Название' = DATA STRING (Location) NONULL IN id;
+// Код — глобально уникальный бизнес-ключ точки (у магазинов сети есть номера).
+// В отличие от MachineBot.machineNumber, уникального только внутри организации:
+// по коду точку адресуют снаружи базы (objectId мобильного API, ERP), и там
+// организация вызывающего неизвестна. Точка без кода — валидна (машины, склады),
+// но снаружи не адресуема.
+code 'Код' = DATA STRING[30] (Location) IN id;
+locationByCode = GROUP AGGR Location l BY code(l);
 address 'Адрес' = DATA ISTRING (Location) IN id;
 latitude 'Широта' = DATA NUMERIC[13,8] (Location) IN id;
 longitude 'Долгота' = DATA NUMERIC[13,8] (Location) IN id;
@@ -21,7 +28,7 @@ recValue 'Влож. значение' (Location l, Attribute a) = GROUP LAST val
 
 FORM locations 'Точки размещения'
     OBJECTS l = Location
-    PROPERTIES(l) name, address, latitude = latitude, longitude = longitude, popupName = name PANEL, calculateCoordinates GRID, NEW, DELETE, nameParent
+    PROPERTIES(l) name, code, address, latitude = latitude, longitude = longitude, popupName = name PANEL, calculateCoordinates GRID, NEW, DELETE, nameParent
 
     OBJECTS cat = Attribute
     PROPERTIES COLUMNS (cat) value(l, cat) HEADER name(cat), recValue(l, cat) HEADER name(cat) + ' (влож.) '

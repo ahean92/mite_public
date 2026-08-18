@@ -20,7 +20,7 @@ REQUIRE Scheme, StoreTaskMite, ManagementReport,
 orgName () = 'ООО «Соседи» (демо)';
 sosedi () = Organization.organization(orgName());
 
-store (STRING nm) = GROUP MAX Location l IF name(l) = nm AND Location.organization(l) = sosedi();
+store (STRING nm) = GROUP MAX Location l IF Location.name(l) = nm AND Location.organization(l) = sosedi();
 equipType (ISTRING[80] nm) = GROUP MAX EquipmentType e IF etName(e) = nm;
 sosediDeviceType () = GROUP MAX DeviceType dt IF name(dt) = r'MITE-T2 (термогигрометр)';
 managerByName (STRING nm) = GROUP MAX ControllerManager m IF ControllerManagement.name(m) = nm;
@@ -38,7 +38,11 @@ demoDevice (Device d) = Device.id(d) >= 470000 AND Device.id(d) <= 479999;
 // прибор объявлен внутри GROUP — иначе он останется свободным параметром условия
 // удаления, и платформа ответит «операция над множеством некорректна»
 demoManager (ControllerManager m) = GROUP SUM 1 IF usedValue(m, Device d) AND demoDevice(d);
-demoTask (Task t) = GROUP SUM 1 IF checkObject(t) = Device d AND demoDevice(d);
+// демо-точка — та, на которой стоит демо-прибор; демо-задача — по прибору сида
+// (mkTask и правило инцидента ставят device) или по его точке (задачи, созданные
+// приложением через apiCreateTask, прибора не имеют — только объект)
+demoLocation (Location l) = GROUP MAX demoDevice(Device d) IF location(d) = l;
+demoTask (Task t) = demoDevice(StoreTask.device(t)) OR demoLocation(checkObject(t) AS Location);
 
 // ===== Шаги сида =====
 // Сид и сброс идут через HTTP Action API, где отказ APPLY по ограничению никому не
@@ -50,16 +54,21 @@ applyStep (STRING step) {
 }
 
 // Магазин сети: точка размещения с адресом и координатами (по ним же садится
-// оборудование на карту объектов).
-mkStore (STRING nm, ISTRING addr, NUMERIC[13,8] lat, NUMERIC[13,8] lon) {
+// оборудование на карту объектов). Код — бизнес-ключ объекта проверки: по нему
+// мобильное приложение адресует магазин (objectId). Проставляется и уже
+// существующей точке, чтобы прогон сида поверх старой базы без кодов дочинил их.
+mkStore (STRING nm, STRING[30] cd, ISTRING addr, NUMERIC[13,8] lat, NUMERIC[13,8] lon) {
     IF NOT store(nm) THEN
         NEW l = Location {
-            name(l) <- nm;
-            address(l) <- addr;
+            // Location.name/address — с квалификатором: точка теперь CheckObject,
+            // и голые name/address видят ещё и абстракции StoreTask
+            Location.name(l) <- nm;
+            Location.address(l) <- addr;
             Location.latitude(l) <- lat;
             Location.longitude(l) <- lon;
             Location.organization(l) <- sosedi();
         }
+    Location.code(store(nm)) <- cd;
 }
 
 // Тип холодильного оборудования: форма для 3D, нормы температуры (из них потом
@@ -138,12 +147,14 @@ mkStaff (STRING lg, STRING first, STRING last, STRING fio, STRING pos, STRING ro
 }
 
 // Задача службы эксплуатации. Тип у всех один («Процедура»): в mite задача — это
-// выезд по объекту проверки, а объект проверки — прибор MITE на оборудовании.
+// выезд по объекту проверки. Объект — магазин (точка размещения прибора), сам
+// прибор — отдельным свойством задачи (тикет 36775).
 mkTask (ISTRING nm, LONG devId, STRING statusId, STRING prioId, STRING lg, INTEGER days, INTEGER prog, STRING descr) {
     IF NOT taskByName(nm) THEN
         NEW t = Task {
             StoreTask.name(t) <- nm;
-            checkObject(t) <- device(devId);
+            checkObject(t) <- location(device(devId));
+            StoreTask.device(t) <- device(devId);
             type(t) <- taskType(r'form');
             status(t) <- taskStatus(statusId);
             priority(t) <- taskPriority(prioId);
@@ -300,13 +311,13 @@ generateSosediDemo 'Демо-данные сети «Соседи»' () {
 
     // магазины сети и распределительный центр
     NEWSESSION {
-        mkStore('«Соседи» на Притыцкого', 'г. Минск, ул. Притыцкого, 29', 53.90780000, 27.47150000);
-        mkStore('«Соседи» на Немиге', 'г. Минск, ул. Немига, 12', 53.90450000, 27.55100000);
-        mkStore('«Соседи» в Уручье', 'г. Минск, пр-т Независимости, 168', 53.94100000, 27.67200000);
-        mkStore('«Соседи» на Ангарской', 'г. Минск, ул. Ангарская, 60', 53.87600000, 27.64800000);
-        mkStore('«Соседи» в Малиновке', 'г. Минск, ул. Есенина, 16', 53.85600000, 27.48800000);
-        mkStore('«Соседи» на Каменногорской', 'г. Минск, ул. Каменногорская, 3', 53.91600000, 27.43400000);
-        mkStore('РЦ «Соседи», Логойский тракт', 'г. Минск, Логойский тракт, 37', 53.96000000, 27.61000000);
+        mkStore('«Соседи» на Притыцкого', r'SOS-101', 'г. Минск, ул. Притыцкого, 29', 53.90780000, 27.47150000);
+        mkStore('«Соседи» на Немиге', r'SOS-102', 'г. Минск, ул. Немига, 12', 53.90450000, 27.55100000);
+        mkStore('«Соседи» в Уручье', r'SOS-103', 'г. Минск, пр-т Независимости, 168', 53.94100000, 27.67200000);
+        mkStore('«Соседи» на Ангарской', r'SOS-104', 'г. Минск, ул. Ангарская, 60', 53.87600000, 27.64800000);
+        mkStore('«Соседи» в Малиновке', r'SOS-105', 'г. Минск, ул. Есенина, 16', 53.85600000, 27.48800000);
+        mkStore('«Соседи» на Каменногорской', r'SOS-106', 'г. Минск, ул. Каменногорская, 3', 53.91600000, 27.43400000);
+        mkStore('РЦ «Соседи», Логойский тракт', r'SOS-RC1', 'г. Минск, Логойский тракт, 37', 53.96000000, 27.61000000);
         applyStep('магазины');
     }
 
@@ -426,7 +437,7 @@ generateSosediDemo 'Демо-данные сети «Соседи»' () {
     }
 
     MESSAGE 'Демо-данные сети «Соседи» загружены.\n\n'
-          + '7 объектов: 6 магазинов Минска и распределительный центр.\n'
+          + '7 объектов проверки: 6 магазинов Минска (коды SOS-101…SOS-106) и распределительный центр (SOS-RC1).\n'
           + '21 прибор MITE на горках, ларях, витринах и камерах РЦ — суточная история с шагом 30 минут.\n'
           + 'Пороги режима заведены по нормам типов оборудования (две границы на единицу).\n\n'
           + 'Авария: ларь заморозки на Притыцкого (прибор 470102) третий час выше нормы — заведён акт ИНЦ-2026-0147 и задача на выезд.\n\n'
@@ -443,7 +454,7 @@ generateSosediDemo 'Демо-данные сети «Соседи»' () {
 // задач платформа убирает сама (controller у ManagerCondition — NONULL AGGR,
 // task у Execution — NONULL DELETE).
 //
-dropStore (STRING nm) { DELETE Location l WHERE name(l) = nm; }
+dropStore (STRING nm) { DELETE Location l WHERE Location.name(l) = nm; }
 dropStaff (STRING lg) { DELETE CustomUser u WHERE login(u) = lg; }
 dropEmployee (STRING fio) { DELETE Employee e WHERE ManagementReport.name(e) = fio; }
 

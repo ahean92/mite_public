@@ -3,7 +3,8 @@ MODULE Scheme;
 // Навигируемая карта объекта: иерархия схем (площадка → здание → этаж → зона)
 // + кликабельный JS-компонент (клик по зданию/этажу проваливается внутрь).
 // Топ-модуль приложения: тянет цепочку фич (Mite + бот машин).
-REQUIRE Mite, MachineBot;
+// StoreTaskMite — явно (не через Mite): здесь реализуется его хук unitName.
+REQUIRE Mite, MachineBot, StoreTaskMite;
 
 NAMESPACE Mite;
 
@@ -305,6 +306,13 @@ euMeasure 'Метрика' = DATA MeasurementType (EquipmentUnit);
 euSource 'Источник' = DATA ISTRING[6] (EquipmentUnit);     // sim | live
 // живое значение из датчика (как schemeValue ячеек), иначе NULL → сцена берёт модель
 euLiveValue 'Текущее (live)' (EquipmentUnit u) = prevLastValue(euDevice(u), euMeasure(u)) IF euSource(u) = 'live' AND euDevice(u);
+
+// обратная связка прибор → единица оборудования: ею подсистема задач подписывает
+// задачу («Авария: ... — Уручье · горка молочная»). GROUP MAX, а не AGGR: жёсткой
+// уникальности датчика у юнита модель не обещает, для подписи достаточно любого
+euByDevice (Device d) = GROUP MAX EquipmentUnit u IF euDevice(u) = d;
+// реализация хука StoreTaskMite (сам он Scheme подтянуть не может — цикл REQUIRE)
+StoreTask.unitName (Device d) += euName(euByDevice(d));
 
 equipTypeByShape (ISTRING[12] sh) = GROUP MAX EquipmentType e IF etShape(e) = sh;
 unitRec (EquipmentUnit u) = 'U^' + (OVERRIDE euName(u), '') + '^' + (OVERRIDE etShape(euType(u)), 'machine') + '^' + (OVERRIDE euGroup(u), '')

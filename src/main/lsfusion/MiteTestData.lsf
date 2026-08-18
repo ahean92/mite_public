@@ -3,7 +3,8 @@ MODULE MiteTestData;
 REQUIRE Measurement, OrgDevice, OrgLocation, OrgUser, StoreTaskMite, DefaultData, Authentication;
 
 // Генератор тестовых данных для пустой базы: организация с пользователями, точки
-// размещения, датчики с суточной историей измерений и задачи на приборы.
+// размещения с кодами, датчики с суточной историей измерений и задачи на точки
+// (объект проверки — точка размещения, прибор — свойством задачи; тикет 36775).
 // Сознательно не зависит от модуля Mite (иначе цикл: Mite подключает генератор) —
 // поэтому типы измерений ищутся по имени локально, а mite-специфика вроде
 // ID контейнера и флага «машина» у точки не заполняется.
@@ -12,6 +13,10 @@ REQUIRE Measurement, OrgDevice, OrgLocation, OrgUser, StoreTaskMite, DefaultData
 demoTemperatureType = GROUP MAX MeasurementType mt IF name(mt) = 'Температура';
 demoHumidityType = GROUP MAX MeasurementType mt IF name(mt) = 'Влажность';
 demoBatteryType = GROUP MAX MeasurementType mt IF name(mt) = 'Батарея';
+// имена — те, по которым Location ищет latitudeType()/longitudeType(): GPS в
+// телеметрии машины возит её точку по карте как объект проверки
+demoLatitudeType = GROUP MAX MeasurementType mt IF name(mt) = 'Широта';
+demoLongitudeType = GROUP MAX MeasurementType mt IF name(mt) = 'Долгота';
 
 generateDemoData 'Сгенерировать тестовые данные' () {
 
@@ -92,10 +97,12 @@ generateDemoData 'Сгенерировать тестовые данные' () {
         IF NOT demoTemperatureType() THEN NEW mt = MeasurementType { id(mt) <- 901; name(mt) <- 'Температура'; }
         IF NOT demoHumidityType() THEN NEW mt = MeasurementType { id(mt) <- 902; name(mt) <- 'Влажность'; }
         IF NOT demoBatteryType() THEN NEW mt = MeasurementType { id(mt) <- 903; name(mt) <- 'Батарея'; }
+        IF NOT demoLatitudeType() THEN NEW mt = MeasurementType { id(mt) <- 904; name(mt) <- 'Широта'; }
+        IF NOT demoLongitudeType() THEN NEW mt = MeasurementType { id(mt) <- 905; name(mt) <- 'Долгота'; }
         APPLY;
     }
 
-    // тип датчика с раскладкой типов измерений
+    // тип датчика с раскладкой типов измерений (GPS — для прибора машины)
     NEWSESSION {
         NEW dt = DeviceType {
             id(dt) <- 900;
@@ -103,21 +110,32 @@ generateDemoData 'Сгенерировать тестовые данные' () {
             number(dt, demoTemperatureType()) <- 1;
             number(dt, demoHumidityType()) <- 2;
             number(dt, demoBatteryType()) <- 3;
+            number(dt, demoLatitudeType()) <- 4;
+            number(dt, demoLongitudeType()) <- 5;
         }
         APPLY;
     }
 
-    // точки размещения и датчики: склад с двумя, машина с одним
+    // точки размещения и датчики: склад с двумя, машина с одним. Точки — объекты
+    // проверки: код обязателен для адресации из приложения, координаты у склада
+    // свои, у машины намеренно нет — её возит GPS из телеметрии прибора 910003
     NEWSESSION {
         FOR Organization o = Organization.organization('Демо-организация') DO {
+            // Location.name/code/address — с квалификатором: точка теперь CheckObject,
+            // и голые имена видят ещё и абстракции StoreTask
             NEW l = Location {
-                name(l) <- 'Склад (демо)';
+                Location.name(l) <- 'Склад (демо)';
+                Location.code(l) <- r'WH-01';
+                Location.address(l) <- 'г. Брест, ул. Складская, 5';
+                Location.latitude(l) <- 52.09760000;
+                Location.longitude(l) <- 23.73410000;
                 organization(l) <- o;
                 NEW d = Device { id(d) <- 910001; type(d) <- (GROUP MAX DeviceType x IF id(x) = 900); location(d) <- l; organization(d) <- o; }
                 NEW d = Device { id(d) <- 910002; type(d) <- (GROUP MAX DeviceType x IF id(x) = 900); location(d) <- l; organization(d) <- o; }
             }
             NEW l = Location {
-                name(l) <- 'Машина 4750 (демо)';
+                Location.name(l) <- 'Машина 4750 (демо)';
+                Location.code(l) <- r'M-4750';
                 organization(l) <- o;
                 NEW d = Device { id(d) <- 910003; type(d) <- (GROUP MAX DeviceType x IF id(x) = 900); location(d) <- l; organization(d) <- o; }
             }
@@ -126,7 +144,8 @@ generateDemoData 'Сгенерировать тестовые данные' () {
     }
 
     // измерения за последние сутки, шаг 30 минут; у датчика 910003 последние
-    // 3 часа температура выше нормы 2–8 °C — материал для сценария «авария»
+    // 3 часа температура выше нормы 2–8 °C — материал для сценария «авария»,
+    // плюс GPS с дрейфом ±100 м — точка-машина «ездит» как объект проверки
     NEWSESSION {
         LOCAL tm = ZDATETIME ();
         FOR Device d IS Device AND id(d) >= 910001 AND id(d) <= 910003 DO {
@@ -140,6 +159,10 @@ generateDemoData 'Сгенерировать тестовые данные' () {
                     value(m, demoBatteryType()) <- 95.0 - random() * 10;
                     IF id(d) = 910003 AND tm() >= sumSeconds(currentZDateTime(), -10800) THEN
                         value(m, demoTemperatureType()) <- 9.5 + random();
+                    IF id(d) = 910003 THEN {
+                        value(m, demoLatitudeType()) <- 52.0978 + (random() - 0.5) * 0.002;
+                        value(m, demoLongitudeType()) <- 23.7345 + (random() - 0.5) * 0.002;
+                    }
                 }
                 tm() <- sumSeconds(tm(), 1800);
             }
@@ -147,11 +170,13 @@ generateDemoData 'Сгенерировать тестовые данные' () {
         APPLY;
     }
 
-    // задачи: открытая обычная, открытая аварийная по шаблону, закрытая
+    // задачи: открытая обычная, открытая аварийная по шаблону, закрытая.
+    // Объект — точка размещения прибора, сам прибор — свойством задачи
     NEWSESSION {
         NEW t = Task {
             name(t) <- 'Осмотр датчика после поверки';
-            checkObject(t) <- device(910001);
+            checkObject(t) <- location(device(910001));
+            StoreTask.device(t) <- device(910001);
             type(t) <- taskType('form');
             template(t) <- templateByName('Авария: отклонение температуры');
             priority(t) <- GROUP MAX TaskPriority p IF id(p) = 'normal';
@@ -161,7 +186,8 @@ generateDemoData 'Сгенерировать тестовые данные' () {
         }
         NEW t = Task {
             name(t) <- 'Авария: отклонение температуры в контейнере 3';
-            checkObject(t) <- device(910003);
+            checkObject(t) <- location(device(910003));
+            StoreTask.device(t) <- device(910003);
             type(t) <- taskType('form');
             template(t) <- templateByName('Авария: отклонение температуры');
             priority(t) <- GROUP MAX TaskPriority p IF id(p) = 'high';
@@ -171,7 +197,8 @@ generateDemoData 'Сгенерировать тестовые данные' () {
         }
         NEW t = Task {
             name(t) <- 'Замена батареи (выполнена)';
-            checkObject(t) <- device(910002);
+            checkObject(t) <- location(device(910002));
+            StoreTask.device(t) <- device(910002);
             type(t) <- taskType('form');
             status(t) <- taskStatus('done');
             priority(t) <- GROUP MAX TaskPriority p IF id(p) = 'low';
@@ -181,7 +208,7 @@ generateDemoData 'Сгенерировать тестовые данные' () {
         APPLY;
     }
 
-    MESSAGE 'Тестовые данные созданы.\n\nПользователи (пароль у всех: demo):\n  demo.admin — администратор организации\n  demo.user1 (Пётр Выездной), demo.user2 (Сергей Наладчиков) — сотрудники-исполнители\n\nДатчики 910001–910002 на складе, 910003 на машине (последние 3 часа — перегрев).\nЗадачи: 2 открытые (одна аварийная) и 1 закрытая.' NOWAIT;
+    MESSAGE 'Тестовые данные созданы.\n\nПользователи (пароль у всех: demo):\n  demo.admin — администратор организации\n  demo.user1 (Пётр Выездной), demo.user2 (Сергей Наладчиков) — сотрудники-исполнители\n\nОбъекты проверки: склад WH-01 (датчики 910001–910002) и машина M-4750 (датчик 910003 с GPS; последние 3 часа — перегрев).\nЗадачи: 2 открытые (одна аварийная) и 1 закрытая.' NOWAIT;
 }
 
 EXTEND FORM organizations

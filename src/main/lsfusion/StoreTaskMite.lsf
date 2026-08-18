@@ -5,8 +5,9 @@ REQUIRE StoreTaskLib, Authentication, SystemEvents,
 
 NAMESPACE StoreTask;
 
-// Хост-пакет mite для подсистемы задач (тикет 31): исполнитель, мост приборов,
-// права по организациям и сид шаблона аварии.
+// Хост-пакет mite для подсистемы задач (тикет 31): исполнитель, мост точек
+// размещения (объект проверки — точка, тикет 36775), права по организациям
+// и сид шаблона аварии.
 
 // ===== 31.3 Исполнитель: сотрудник (Employee из management/ManagementReport) =====
 // Единый справочник людей: те же сотрудники, что в актах обработки инцидентов
@@ -50,43 +51,73 @@ NAVIGATOR {
     }
 }
 
-// ===== 31.2 Мост приборов: датчик MITE — объект проверки =====
-EXTEND CLASS Device : CheckObject;
+// ===== 31.2 Мост точек: точка размещения — объект проверки (тикет 36775) =====
+// Объект проверки — место, куда человек приезжает, а не датчик, который там висит.
+// Пока объектом был прибор, на одной точке было столько объектов, сколько датчиков,
+// а гео-гейт по построению выбирает один — задачи соседних датчиков той же точки
+// были не видны в принципе (три прибора «Соседей» в Уручье, задача на витрине
+// пропадала из списка).
+EXTEND CLASS Location : CheckObject;
 
-// StoreTask.name — явно: у Device есть и второй абстрактный name (ControllerManagement).
-// Device.id — тоже явно, и по той же причине: в этом неймспейсе голый id(d) означает
-// StoreTask.id(CheckObject), потому что Device — наследник CheckObject, а текущий
-// неймспейс при разборе имени идёт первым. Без квалификатора номер прибора в названии
-// молча брался из неподнятого сейма и был пуст.
-StoreTask.name (Device d) += ISTRING[150](CONCAT ' ', nameType(d), '№' + Device.id(d));
-address (Device d) += ISTRING[250](Location.name(location(d)));
+// Location.name/address — явно: голый name(l) в этом неймспейсе означает
+// StoreTask.name(CheckObject), потому что Location теперь наследник CheckObject,
+// а текущий неймспейс при разборе имени идёт первым (та же гоча, что была у моста
+// приборов с Device.id).
+StoreTask.name (Location l) += ISTRING[150](Location.name(l));
+address (Location l) += ISTRING[250](Location.address(l));
 
-// Серийный номер прибора — тот же ключ, что виден в названии; по нему приложение
-// адресует объект (objectId в apiTasks) и фильтрует задачи «по этому прибору».
-StoreTask.id (Device d) += ISTRING[30](STRING(Device.id(d)));
+// Код точки — тот же ключ, что в справочнике: по нему приложение адресует объект
+// (objectId в apiTasks) и фильтрует задачи «точки, на которой я стою».
+StoreTask.id (Location l) += ISTRING[30](Location.code(l));
 
-// Координаты: у прибора они уже посчитаны в Location — собственные, если телеметрия
-// их присылает, иначе точки размещения. Квалификаторы обязательны, как и у name:
-// latitude/longitude есть и у Location(Device), и у StoreTask(CheckObject).
-StoreTask.latitude (Device d) += DOUBLE(Location.latitude(d));
-StoreTask.longitude (Device d) += DOUBLE(Location.longitude(d));
+// Координаты: свои, иначе — последнего отчитавшегося прибора точки. Fallback
+// держит машины MachineBot живыми объектами проверки: собственных координат у
+// машины нет, её возит GPS из телеметрии прибора (Location.latitude(Device) —
+// OVERRIDE замера и точки размещения).
+lastReportedDevice (Location l) = GROUP LAST Device d ORDER dateTime(lastMeasurement(d)), d WHERE location(d) = l;
+StoreTask.latitude (Location l) += DOUBLE(OVERRIDE Location.latitude(l), Location.latitude(lastReportedDevice(l)));
+StoreTask.longitude (Location l) += DOUBLE(OVERRIDE Location.longitude(l), Location.longitude(lastReportedDevice(l)));
 
-// ===== Права: организация задачи выводится из её прибора, не хранится.
+// Задача продолжает указывать на конкретное оборудование: прибор — отдельным
+// свойством, а не объектом проверки.
+device 'Прибор' = DATA Device (Task);
+idDevice 'Прибор' (Task t) = STRING(Device.id(device(t)));
+
+// Единица оборудования прибора («Уручье · горка молочная»). Реализация — в Scheme,
+// где живёт EquipmentUnit: сюда Scheme не подтянуть, Scheme -> Mite -> StoreTaskMite
+// замкнулись бы в цикл REQUIRE.
+unitName 'Оборудование' = ABSTRACT ISTRING[80] (Device);
+nameUnit 'Оборудование' (Task t) = unitName(device(t));
+
+EXTEND FORM tasks
+    PROPERTIES(t) READONLY idDevice, nameUnit
+;
+EXTEND FORM task
+    PROPERTIES(t) READONLY idDevice, nameUnit
+;
+DESIGN task {
+    params {
+        MOVE PROPERTY(idDevice(t));
+        MOVE PROPERTY(nameUnit(t));
+    }
+}
+
+// ===== Права: организация задачи выводится из её точки, не хранится.
 // Орг-пользователь видит и назначает только в рамках своей организации;
 // пользователи без организации (глобальные) не ограничены.
 EXTEND FORM tasks
-    FILTERS NOT organization(checkObject(t) AS Device) != organization(currentUser())
+    FILTERS NOT organization(checkObject(t) AS Location) != organization(currentUser())
 ;
 EXTEND FORM checkObjects
-    FILTERS NOT organization(o AS Device) != organization(currentUser())
+    FILTERS NOT organization(o AS Location) != organization(currentUser())
 ;
 EXTEND FORM taskPerformers
     FILTERS NOT organization(p AS Employee) != organization(currentUser())
 ;
 
-CONSTRAINT organization(assignedTo(Task t) AS Employee) != organization(checkObject(t) AS Device)
+CONSTRAINT organization(assignedTo(Task t) AS Employee) != organization(checkObject(t) AS Location)
     CHECKED BY assignedTo[Task]
-    MESSAGE 'Исполнитель и прибор задачи принадлежат разным организациям';
+    MESSAGE 'Исполнитель и объект задачи принадлежат разным организациям';
 
 // Орг-роли mite (fillDefaultAccess) запрещают весь навигатор через forbid System.root —
 // дерево у орг-пользователя пустое, и веб-клиент падает на нём (NPE на null root).
@@ -193,8 +224,11 @@ WHEN SET(ManagerLog l IS ManagerLog) AND isOn(l)
         NEW t = Task {
             type(t) <- formTaskType();
             template(t) <- emergencyTemplate();
-            name(t) <- emergencyTemplateName();
-            checkObject(t) <- incidentDevice(manager(l));
+            // имя — с единицей оборудования: «Авария: отклонение температуры —
+            // Притыцкого · ларь заморозки»; без юнита CONCAT оставит голое имя шаблона
+            name(t) <- (CONCAT ' — ', emergencyTemplateName(), unitName(incidentDevice(manager(l))));
+            checkObject(t) <- location(incidentDevice(manager(l)));
+            device(t) <- incidentDevice(manager(l));
             priority(t) <- OVERRIDE priorityByDeviation(deviationStatus(l)), taskPriority('normal');
             incidentValue(t) <- incidentValue(manager(l));
             incidentMin(t) <- incidentMin(manager(l));
