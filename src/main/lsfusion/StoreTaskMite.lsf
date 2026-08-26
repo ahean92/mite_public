@@ -34,6 +34,20 @@ in (Employee p, User u) += p = employee(u AS CustomUser);
 
 performer (CustomUser u) += employee(u);
 
+// ===== Канал 'employee' (#36841): «сотрудники этого магазина» =====
+// Штатное расписание mite — организация: сотрудники организации точки и есть её штат.
+// Поверх — роли на объекте (ядро, ObjectRole): ответственным может стоять и
+// подразделение (TaskUnit) — тогда сотрудниками объекта становится его состав,
+// с вложенными отделами (hasIn — транзитивно). Фильтр — подсказка для поиска, не
+// запрет (дизайн строк, раздел 12.5): не нашли здесь — apiRowSubjects отдаёт весь
+// канал или ищет по all=1.
+staffRole (Employee e, CheckObject o) =
+    GROUP SUM 1 IF hasIn(person(o, ObjectRole r), user(e)) AND active(r);
+available (Employee e, CheckObject o) +=
+    TRUE IF organization(e) = organization(o AS Location) OR staffRole(e, o);
+// в архиве = выбыл из справочника (retired уже реализован ядром поверх archived —
+// см. RefPerformer: dismissed сюда доезжает через archived(Employee))
+
 // справочник сотрудников (у mite-овского Employee своей формы не было)
 changeUser (Employee e) {
     DIALOG customUsersDialog OBJECTS u = user(e) INPUT NULL DO user(e) <- u;
