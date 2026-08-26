@@ -1,6 +1,9 @@
 MODULE StoreTaskMite;
 
-REQUIRE StoreTaskLib, Authentication, SystemEvents,
+// ExternalApp — запуск внешних приложений с главного экрана телефона (#36840).
+// Модуль намеренно не входит в StoreTaskLib: хост, которому он нужен, подключает его
+// сам — этой строкой. Хост без неё не несёт ни таблицы, ни формы, ни ручки.
+REQUIRE StoreTaskLib, ExternalApp, Authentication, SystemEvents,
         Device, Location, OrgDevice, OrgUser, ManagementReport;
 
 NAMESPACE StoreTask;
