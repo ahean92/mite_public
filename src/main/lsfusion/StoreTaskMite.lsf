@@ -3,7 +3,12 @@ MODULE StoreTaskMite;
 // ExternalApp — запуск внешних приложений с главного экрана телефона (#36840).
 // Модуль намеренно не входит в StoreTaskLib: хост, которому он нужен, подключает его
 // сам — этой строкой. Хост без неё не несёт ни таблицы, ни формы, ни ручки.
-REQUIRE StoreTaskLib, ExternalApp, Authentication, SystemEvents,
+//
+// SubjectStock — тем же порядком (#36943): остатки объекта по каналу 'item', то есть
+// строки табличного поля от хоста (rowSource = 'host') и признак внесистемной позиции.
+// Настоящих остатков у mite нет — здесь это пользовательский справочник, ровно как
+// решено приёмкой #36780: артефакт даёт канал, хост решает, чем его наполнить.
+REQUIRE StoreTaskLib, ExternalApp, SubjectStock, Authentication, SystemEvents,
         Device, Location, OrgDevice, OrgUser, ManagementReport;
 
 NAMESPACE StoreTask;
