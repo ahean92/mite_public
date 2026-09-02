@@ -86,7 +86,10 @@ EXTEND CLASS Location : CheckObject;
 // а текущий неймспейс при разборе имени идёт первым (та же гоча, что была у моста
 // приборов с Device.id).
 StoreTask.name (Location l) += ISTRING[150](Location.name(l));
-address (Location l) += ISTRING[250](Location.address(l));
+// Свои атрибуты объекта — ownAddress/ownLatitude/ownLongitude: то, что объект ПОКАЗЫВАЕТ
+// (address/latitude/longitude), ядро с 2026-08-31 считает само по дереву объектов
+// (наследование от расположения), хост эти имена больше не реализует.
+ownAddress (Location l) += ISTRING[250](Location.address(l));
 
 // Код точки — тот же ключ, что в справочнике: по нему приложение адресует объект
 // (objectId в apiTasks) и фильтрует задачи «точки, на которой я стою».
@@ -97,8 +100,8 @@ StoreTask.id (Location l) += ISTRING[30](Location.code(l));
 // машины нет, её возит GPS из телеметрии прибора (Location.latitude(Device) —
 // OVERRIDE замера и точки размещения).
 lastReportedDevice (Location l) = GROUP LAST Device d ORDER dateTime(lastMeasurement(d)), d WHERE location(d) = l;
-StoreTask.latitude (Location l) += DOUBLE(OVERRIDE Location.latitude(l), Location.latitude(lastReportedDevice(l)));
-StoreTask.longitude (Location l) += DOUBLE(OVERRIDE Location.longitude(l), Location.longitude(lastReportedDevice(l)));
+StoreTask.ownLatitude (Location l) += DOUBLE(OVERRIDE Location.latitude(l), Location.latitude(lastReportedDevice(l)));
+StoreTask.ownLongitude (Location l) += DOUBLE(OVERRIDE Location.longitude(l), Location.longitude(lastReportedDevice(l)));
 
 // Задача продолжает указывать на конкретное оборудование: прибор — отдельным
 // свойством, а не объектом проверки.
