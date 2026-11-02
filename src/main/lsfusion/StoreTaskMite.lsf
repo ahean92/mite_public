@@ -15,8 +15,12 @@ MODULE StoreTaskMite;
 // MiteTestData), голого имени Chat не используют, а Management/OrgManagement платформенный
 // Chat не видят — конфликт не материализуется. mite — дев-стенд, чат на нём нужен для
 // проверки ручек телефоном.
-REQUIRE StoreTaskLib, StoreTaskChatLib, ExternalApp, SubjectStock, Authentication, SystemEvents,
-        Device, Location, OrgDevice, OrgUser, ManagementReport;
+//
+// NotificationChat — стык чата и уведомлений (#37367): пуш о сообщениях чата тем же
+// механизмом, что пуш по задачам. Требует оба пакета и потому подключается хостом —
+// этой строкой; без неё чат работает, пуша о сообщениях нет.
+REQUIRE StoreTaskLib, StoreTaskChatLib, NotificationChat, ExternalApp, SubjectStock, Authentication,
+        SystemEvents, Device, Location, OrgDevice, OrgUser, ManagementReport;
 
 NAMESPACE StoreTask;
 
