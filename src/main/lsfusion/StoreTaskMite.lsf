@@ -8,7 +8,14 @@ MODULE StoreTaskMite;
 // строки табличного поля от хоста (rowSource = 'host') и признак внесистемной позиции.
 // Настоящих остатков у mite нет — здесь это пользовательский справочник, ровно как
 // решено приёмкой #36780: артефакт даёт канал, хост решает, чем его наполнить.
-REQUIRE StoreTaskLib, ExternalApp, SubjectStock, Authentication, SystemEvents,
+//
+// StoreTaskChatLib — чат для телефона (#37366), тем же порядком опция хоста. Дизайн
+// держал его вне mite из-за имени Chat (здесь оно занято Messenger.Chat), но модули,
+// которые после этой строки видят оба класса (StoreTaskMite, Mite, Scheme, SosediDemo,
+// MiteTestData), голого имени Chat не используют, а Management/OrgManagement платформенный
+// Chat не видят — конфликт не материализуется. mite — дев-стенд, чат на нём нужен для
+// проверки ручек телефоном.
+REQUIRE StoreTaskLib, StoreTaskChatLib, ExternalApp, SubjectStock, Authentication, SystemEvents,
         Device, Location, OrgDevice, OrgUser, ManagementReport;
 
 NAMESPACE StoreTask;
