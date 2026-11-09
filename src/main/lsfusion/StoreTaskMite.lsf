@@ -19,7 +19,12 @@ MODULE StoreTaskMite;
 // NotificationChat — стык чата и уведомлений (#37367): пуш о сообщениях чата тем же
 // механизмом, что пуш по задачам. Требует оба пакета и потому подключается хостом —
 // этой строкой; без неё чат работает, пуша о сообщениях нет.
-REQUIRE StoreTaskLib, StoreTaskChatLib, NotificationChat, ExternalApp, SubjectStock, Authentication,
+//
+// StoreTaskHypothesisLib — гипотезы, тоже опция хоста: в StoreTaskLib пакет больше не
+// входит, потому что код проверки исполняется на рабочей базе. mite — дев-стенд, гипотезы
+// на нём нужны для проверки; работать с ними может роль с правами «Вести гипотезы» и
+// «Утверждать гипотезы» (по умолчанию — администратор).
+REQUIRE StoreTaskLib, StoreTaskChatLib, NotificationChat, StoreTaskHypothesisLib, ExternalApp, SubjectStock, Authentication,
         SystemEvents, Device, Location, OrgDevice, OrgUser, ManagementReport;
 
 NAMESPACE StoreTask;
